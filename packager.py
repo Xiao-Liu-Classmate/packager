@@ -701,7 +701,12 @@ def generate_nsis_script(cfg):
         app_name,
         # NSIS 中 & 是加速键标记，需双写避免标题/开始菜单显示异常
         " \"%s\"" % app_name.replace("&", "&&") if "&" in app_name else ""))
-    L.append("OutFile \"%s_setup.exe\"" % _nsis_escape_path(os.path.join(cfg["last_output"], app_name)))
+    # 脚本面向 Windows，路径分隔符固定用反斜杠。
+    # 不能用 os.path.join：在 Linux 上生成会变成 /，产物无法安装。
+    out_dir = cfg["last_output"].rstrip("\\/")
+    if not out_dir:
+        out_dir = "."
+    L.append("OutFile \"%s_setup.exe\"" % _nsis_escape_path(out_dir + "\\" + app_name))
     L.append("InstallDir \"$PROGRAMFILES\\%s\"" % app_name)
     L.append("InstallDirRegKey HKLM \"Software\\%s\" \"InstallDir\"" % app_name)
     if icon_path and os.path.isfile(icon_path):
@@ -2457,7 +2462,23 @@ class PackagerApp:
 # ============================================================
 # N. CLI Support
 # ============================================================
+def _ensure_console_encoding():
+    """控制台编码无法表示中文时降级为替换字符，避免程序直接崩溃。
+
+    英文 Windows / CI 的 stdout 默认是 cp1252，直接 print 中文会抛
+    UnicodeEncodeError（实测 GitHub Actions 上 --list-modes 即崩溃）。
+    这里只放宽错误策略、不改动编码本身，中文系统输出不受影响。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(errors="replace")
+        except Exception:
+            pass
+
+
 def cli_main():
+    _ensure_console_encoding()
     parser = argparse.ArgumentParser(description="%s v%s" % (APP_NAME, APP_VERSION))
     parser.add_argument("--source", "-s", help="源文件夹路径")
     parser.add_argument("--output", "-o", help="输出目录路径")
@@ -2634,6 +2655,10 @@ def _show_splash(root):
 
 
 def main():
+    # 先确保控制台能安全输出中文：CLI 分支走 cli_main 也会再调一次（幂等），
+    # GUI 分支未捕获异常的 traceback 同样含中文，缺这步会二次抛
+    # UnicodeEncodeError 把真实错误掩盖掉。
+    _ensure_console_encoding()
     if len(sys.argv) > 1:
         cli_main()
     else:
