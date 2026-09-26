@@ -1,0 +1,21 @@
+# 统一换行符，避免跨平台协作差异
+* text=auto
+
+# 批处理必须 CRLF，否则 Windows 上无法执行
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# 源码统一 LF（Git 侧），Windows 检出时按 core.autocrlf 转换
+*.py    text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+
+# 二进制文件不做转换
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.zip   binary
+*.7z    binary
+*.exe   binary

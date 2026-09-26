@@ -6,6 +6,7 @@
 import os
 import sys
 import subprocess
+import threading
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -521,6 +522,142 @@ def test_build_buttons_restored(app):
     instance._set_build_buttons_state(pk.DISABLED)
     assert str(instance.build_button.cget("state")) == pk.DISABLED
     instance._set_build_buttons_state(pk.NORMAL)
+
+
+# ------------------------------------------------------------
+# 线程安全：_call_in_ui / _poll_ui_queue（修 Tk 跨线程调用）
+# ------------------------------------------------------------
+def test_call_in_ui_runs_inline_on_main_thread(app):
+    instance, _root = app
+    seen = []
+    instance._call_in_ui(seen.append, 42)
+    # 主线程调用须立即同步执行，不排队
+    assert seen == [42]
+    assert instance._ui_queue.empty()
+
+
+def test_call_in_ui_queues_from_worker_thread(app):
+    instance, _root = app
+    seen = []
+
+    def worker():
+        instance._call_in_ui(seen.append, "from-thread")
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join(timeout=5)
+    # 后台线程只入队，不直接执行
+    assert seen == [], "后台线程不得直接执行 UI 回调"
+    assert not instance._ui_queue.empty()
+
+    # 主线程轮询消费
+    instance._poll_ui_queue()
+    assert seen == ["from-thread"], "_poll_ui_queue 未消费队列"
+
+
+def test_poll_ui_queue_survives_broken_callback(app, capsys):
+    """单条回调抛异常不得中断轮询，也不能阻塞后续回调"""
+    instance, _root = app
+    seen = []
+    instance._ui_queue.put((lambda: 1 / 0, (), {}))
+    instance._ui_queue.put((seen.append, ("ok",), {}))
+    instance._poll_ui_queue()
+    assert seen == ["ok"], "前一条异常阻断了后续回调"
+    # 异常应向 stderr 报告（可诊断性），但不中断执行
+    assert "ZeroDivisionError" in capsys.readouterr().err
+
+
+def test_poll_ui_queue_reschedules_itself(app, monkeypatch):
+    """轮询须自我重新调度；用 monkeypatch 记录，避免真的留下第二条链"""
+    instance, _root = app
+    calls = []
+    monkeypatch.setattr(instance.root, "after",
+                        lambda delay, cb=None, *a: calls.append(delay))
+    instance._poll_ui_queue()
+    assert calls == [30], "轮询未按 30ms 重新调度自身"
+
+
+def test_poll_ui_queue_budget_caps_work(app, capsys):
+    """单 tick 不得无上限消费，否则突发日志会卡住界面"""
+    instance, _root = app
+    budget = instance._UI_QUEUE_BUDGET
+    assert isinstance(budget, int) and budget > 0
+    done = []
+    for i in range(budget + 20):
+        instance._ui_queue.put((done.append, (i,), {}))
+    instance._poll_ui_queue()
+    assert len(done) <= budget, "超出预算仍继续消费"
+    assert not instance._ui_queue.empty(), "剩余回调应留到下一 tick"
+    # 清空，避免影响其他用例
+    instance._poll_ui_queue()
+    capsys.readouterr()
+
+
+def test_helper_ui_wrappers_route_through_call_in_ui(app, monkeypatch):
+    """_log/_set_progress/_set_status/_add_build_history 须走 _call_in_ui"""
+    instance, _root = app
+    routed = []
+    monkeypatch.setattr(instance, "_call_in_ui",
+                        lambda fn, *a, **k: routed.append((fn.__name__ if hasattr(fn, "__name__") else "cb", a)))
+
+    instance._set_progress(55)
+    instance._set_status("测试状态")
+    assert any(name == "_do" for name, _ in routed), "_set_progress 未走 _call_in_ui"
+    assert len([1 for name, _ in routed if name == "_do"]) >= 2
+
+
+# ------------------------------------------------------------
+# 配置损坏备份与写失败提示
+# ------------------------------------------------------------
+def test_load_config_corrupt_twice_keeps_both_backups(tmp_path, monkeypatch, capsys):
+    """损坏文件二次出现时不能覆盖旧 .bak"""
+    target = tmp_path / "cfg.json"
+    monkeypatch.setattr(pk, "CONFIG_FILE", str(target))
+
+    target.write_text("{ first-bad", encoding="utf-8")
+    pk.load_config()
+    bak = tmp_path / "cfg.json.bak"
+    assert bak.exists()
+    assert bak.read_text(encoding="utf-8") == "{ first-bad"
+
+    # 再次损坏：应生成带时间戳的新备份，旧 .bak 不被覆盖
+    target.write_text("{ second-bad", encoding="utf-8")
+    pk.load_config()
+    assert bak.read_text(encoding="utf-8") == "{ first-bad", "旧备份被覆盖"
+    stamped = [p for p in tmp_path.glob("cfg.json.*.bak")]
+    assert stamped, "未生成时间戳备份"
+    assert stamped[0].read_text(encoding="utf-8") == "{ second-bad"
+
+
+def test_save_config_failure_reports_stderr(tmp_path, monkeypatch, capsys):
+    """写失败不能静默，须向 stderr 提示用户设置未保存"""
+    target = tmp_path / "cfg.json"
+    monkeypatch.setattr(pk, "CONFIG_FILE", str(target))
+
+    def boom(*a, **k):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr("builtins.open", boom)
+    pk.save_config({"a": 1})
+    err = capsys.readouterr().err
+    assert "配置写入失败" in err
+    assert not (tmp_path / "cfg.json.tmp").exists(), "失败后 .tmp 未清理"
+
+
+def test_save_config_cleans_real_tmp_on_replace_failure(tmp_path, monkeypatch, capsys):
+    """.tmp 已真实写入后 os.replace 失败，须清理残留并提示"""
+    target = tmp_path / "cfg.json"
+    monkeypatch.setattr(pk, "CONFIG_FILE", str(target))
+
+    def boom_replace(src, dst):
+        raise OSError("disk error")
+
+    monkeypatch.setattr(pk.os, "replace", boom_replace)
+    pk.save_config({"a": 1})
+    err = capsys.readouterr().err
+    assert "配置写入失败" in err
+    assert not (tmp_path / "cfg.json.tmp").exists(), "真实 .tmp 残留未清理"
+    assert not target.exists(), "失败时不应产生正式配置文件"
 
 
 if __name__ == "__main__":

@@ -9,6 +9,8 @@ import argparse
 import tempfile
 import zipfile
 import time
+import queue
+import traceback
 from pathlib import Path
 from datetime import datetime
 from tkinter import (Tk, Toplevel, Frame, Label, Button, Entry, StringVar,
@@ -135,14 +137,17 @@ def load_config():
                 cfg.update(data)
                 return cfg
     except json.JSONDecodeError:
-        # 配置损坏：保留现场为 .bak，避免用户"设置莫名丢失"却无从排查
+        # 配置损坏：保留现场，避免用户"设置莫名丢失"却无从排查。
+        # .bak 已存在时用微秒时间戳命名，既不覆盖旧备份，坏文件也不会滞留。
         try:
+            stamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
             bak = CONFIG_FILE + ".bak"
-            if not os.path.exists(bak):
-                shutil.move(CONFIG_FILE, bak)
-                print("[警告] 配置文件已损坏，已备份为: %s" % bak, file=sys.stderr)
-        except Exception:
-            pass
+            if os.path.exists(bak):
+                bak = "%s.%s.bak" % (CONFIG_FILE, stamp)
+            shutil.move(CONFIG_FILE, bak)
+            print("[警告] 配置文件已损坏，已备份为: %s" % bak, file=sys.stderr)
+        except Exception as e:
+            print("[警告] 配置损坏且备份失败: %s" % e, file=sys.stderr)
     except PermissionError:
         pass
     except Exception:
@@ -159,11 +164,25 @@ def save_config(cfg):
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
             os.replace(tmp, CONFIG_FILE)
         except PermissionError:
-            pass
-        except OSError:
-            pass
-        except Exception:
-            pass
+            print("[警告] 配置写入失败（权限不足），本次设置未保存: %s"
+                  % CONFIG_FILE, file=sys.stderr)
+            _cleanup_tmp(tmp)
+        except OSError as e:
+            print("[警告] 配置写入失败（磁盘错误）: %s" % e, file=sys.stderr)
+            _cleanup_tmp(tmp)
+        except Exception as e:
+            print("[警告] 配置写入失败: %s: %s"
+                  % (type(e).__name__, e), file=sys.stderr)
+            _cleanup_tmp(tmp)
+
+
+def _cleanup_tmp(tmp):
+    """清理失败残留的临时文件"""
+    try:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    except OSError:
+        pass
 
 
 def load_project(filepath):
@@ -865,6 +884,10 @@ class PackagerApp:
         self.current_project = self.cfg.get("last_project_file", "")
         self.current_theme = self.cfg.get("theme", "light")
         self._building = False
+        # UI 更新队列：后台构建线程只能通过该队列投递回调，
+        # 由主线程 after 轮询消费。Tkinter 非线程安全，
+        # 直接跨线程调用 root.after 属未定义行为，长期运行有崩溃风险。
+        self._ui_queue = queue.Queue()
         # 记录初始配色，供浅色主题恢复使用（避免 configure(bg="") 抛错）
         try:
             self._init_root_bg = self.root.cget("background")
@@ -887,6 +910,55 @@ class PackagerApp:
         self._source_after_id = None
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._load_recent_projects_menu()
+        # 启动 UI 队列轮询（必须在所有控件创建完毕后）
+        self.root.after(30, self._poll_ui_queue)
+
+    # --- Thread-safe UI dispatch ---
+    # 单次轮询最多处理的回调条数：批量打包会产生突发日志，
+    # 不设上限会长时间占住 UI 线程导致界面假死；超出部分留给下一 tick。
+    _UI_QUEUE_BUDGET = 50
+
+    def _call_in_ui(self, fn, *args, **kwargs):
+        """线程安全地把回调调度到主线程执行。
+
+        主线程直接调用（保持即时性）；后台线程投递到队列，
+        由 _poll_ui_queue 在主线程统一消费。
+        """
+        if threading.current_thread() is threading.main_thread():
+            try:
+                fn(*args, **kwargs)
+            except Exception:
+                # 保留可诊断性：与 Tk 默认的 report_callback_exception 一致输出
+                traceback.print_exc()
+            return
+        try:
+            self._ui_queue.put((fn, args, kwargs))
+        except Exception:
+            pass
+
+    def _poll_ui_queue(self):
+        """主线程轮询：消费 UI 队列并重新调度自身。
+
+        每 tick 最多处理 _UI_QUEUE_BUDGET 条，未消费完则下一 tick 继续，
+        避免突发日志把主线程占满。
+        """
+        try:
+            for _ in range(self._UI_QUEUE_BUDGET):
+                try:
+                    fn, args, kwargs = self._ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    fn(*args, **kwargs)
+                except Exception:
+                    # 控件可能已在窗口关闭后销毁，忽略单条失败
+                    traceback.print_exc()
+        except Exception:
+            pass
+        try:
+            self.root.after(30, self._poll_ui_queue)
+        except Exception:
+            pass  # 窗口已销毁，停止轮询
 
     def _setup_styles(self):
         style = ttk.Style()
@@ -1432,23 +1504,29 @@ class PackagerApp:
     # ============================================================
     def _log(self, msg):
         def _do():
-            self.log_text.config(state=NORMAL)
-            if "[成功]" in msg:
-                tag = "success"
-            elif "[错误]" in msg:
-                tag = "error"
-            elif "[警告]" in msg:
-                tag = "warning"
-            else:
-                tag = None
-            line = msg + "\n"
-            if tag:
-                self.log_text.insert(END, line, tag)
-            else:
-                self.log_text.insert(END, line)
-            self.log_text.see(END)
-            self.log_text.config(state=DISABLED)
-        self.root.after(0, _do)
+            try:
+                self.log_text.config(state=NORMAL)
+                if "[成功]" in msg:
+                    tag = "success"
+                elif "[错误]" in msg:
+                    tag = "error"
+                elif "[警告]" in msg:
+                    tag = "warning"
+                else:
+                    tag = None
+                line = msg + "\n"
+                if tag:
+                    self.log_text.insert(END, line, tag)
+                else:
+                    self.log_text.insert(END, line)
+                self.log_text.see(END)
+            finally:
+                # 必须回到只读：否则中途异常时日志区会变成用户可编辑
+                try:
+                    self.log_text.config(state=DISABLED)
+                except Exception:
+                    pass
+        self._call_in_ui(_do)
 
     def _init_log_tags(self):
         """日志颜色标签（仅初始化一次）"""
@@ -1462,12 +1540,12 @@ class PackagerApp:
     def _set_progress(self, value):
         def _do():
             self.progress_var.set(value)
-        self.root.after(0, _do)
+        self._call_in_ui(_do)
 
     def _set_status(self, msg):
         def _do():
             self.status_var.set(msg)
-        self.root.after(0, _do)
+        self._call_in_ui(_do)
 
 
     # ============================================================
@@ -1484,12 +1562,18 @@ class PackagerApp:
         batch_items = list(self.batch_listbox.get(0, END))
 
         def abort(msg, is_error=False):
-            """校验失败：复位打包标志并提示"""
-            self._building = False
-            if is_error:
-                messagebox.showerror("错误", msg)
-            else:
-                messagebox.showwarning("提示", msg)
+            """校验失败：先保持重入锁，提示后再复位标志。
+
+            复位放在弹窗**之后**，使模态期间 _building 仍为 True，
+            此时按 Ctrl+B 会被开头的重入保护拦截，不会叠加对话框。
+            """
+            try:
+                if is_error:
+                    messagebox.showerror("错误", msg)
+                else:
+                    messagebox.showwarning("提示", msg)
+            finally:
+                self._building = False
 
         # 仅批量模式时，允许无单一源文件夹
         if not batch_items:
@@ -1561,8 +1645,12 @@ class PackagerApp:
         self.cfg["license_file"] = self.license_var.get().strip()
         self.cfg["pre_install_cmd"] = self.pre_install_var.get().strip()
         self.cfg["post_install_cmd"] = self.post_install_var.get().strip()
-        self.cfg["window_width"] = self.root.winfo_width()
-        self.cfg["window_height"] = self.root.winfo_height()
+        # 窗口尺寸只是记忆用，控件异常不应中断打包
+        try:
+            self.cfg["window_width"] = self.root.winfo_width()
+            self.cfg["window_height"] = self.root.winfo_height()
+        except Exception:
+            pass
         save_config(self.cfg)
 
         mode = self.mode_var.get()
@@ -1577,16 +1665,28 @@ class PackagerApp:
             self._start_batch_build(batch_items, mode, build_func, app_name)
             return
 
-        # 打包期间禁用按钮，防止重复触发（含 Ctrl+B 快捷键绕过按钮状态）
-        self._set_build_buttons_state(DISABLED)
-        self._set_progress(0)
-        self._set_status("打包中...")
-        self.log_text.config(state=NORMAL)
-        self.log_text.delete("1.0", END)
-        self.log_text.config(state=DISABLED)
-
+        # 打包期间禁用按钮，防止重复触发（含 Ctrl+B 快捷键绕过按钮状态）。
+        # 这段 UI 准备操作必须整体保护：若中途抛异常（控件已销毁、
+        # winfo_width 失败等），_building 与按钮会卡在"禁用"状态。
         mode_names = MODE_NAMES
         start_time = time.time()
+        try:
+            self._set_build_buttons_state(DISABLED)
+            self._set_progress(0)
+            self._set_status("打包中...")
+            self.log_text.config(state=NORMAL)
+            self.log_text.delete("1.0", END)
+            self.log_text.config(state=DISABLED)
+        except Exception as e:
+            self._set_build_buttons_state(NORMAL)
+            self._building = False
+            # log_text 可能停在 NORMAL（可编辑），必须恢复只读
+            try:
+                self.log_text.config(state=DISABLED)
+            except Exception:
+                pass
+            messagebox.showerror("错误", "界面初始化失败，无法开始打包:\n%s" % e)
+            return
 
         def _finish_build():
             """打包结束统一恢复状态（回调在主线程执行）"""
@@ -1626,13 +1726,13 @@ class PackagerApp:
                         )
                         self._play_finish_sound(success=False)
 
-                self.root.after(0, done)
+                self._call_in_ui(done)
             except Exception as e:
                 def fail():
                     _finish_build()
                     self._set_status("打包异常: %s" % e)
                     self._play_finish_sound(success=False)
-                self.root.after(0, fail)
+                self._call_in_ui(fail)
 
         try:
             t = threading.Thread(target=run_build, daemon=True)
@@ -1650,7 +1750,15 @@ class PackagerApp:
             pass
 
     def _play_finish_sound(self, success=True):
-        """打包完成提示音（Windows）；非 Windows 回退系统铃声"""
+        """打包完成提示音（线程安全入口）。
+
+        批量打包在 worker 线程调用本方法，而非 Windows 分支的
+        `root.bell()` 属跨线程 Tk 调用，因此统一调度到主线程执行。
+        """
+        self._call_in_ui(self._play_finish_sound_sync, success)
+
+    def _play_finish_sound_sync(self, success=True):
+        """实际发声逻辑，仅在主线程执行"""
         try:
             import winsound
         except ImportError:
@@ -1675,13 +1783,26 @@ class PackagerApp:
         if app_name is None:
             app_name = self.appname_var.get()
         total = len(batch_items)
-        self._set_build_buttons_state(DISABLED)
-        self._set_progress(0)
-        self._set_status("批量打包中 (共 %d 个)..." % total)
-        self.log_text.config(state=NORMAL)
-        self.log_text.delete("1.0", END)
-        self.log_text.config(state=DISABLED)
-        self._log("========== 批量打包开始 (共 %d 个文件夹) ==========" % total)
+        # 与单构建一致：UI 准备段整体保护，异常时复位标志与按钮，
+        # 否则 _building 卡 True、按钮永久禁用（此后 Ctrl+B 被重入保护拦截）
+        try:
+            self._set_build_buttons_state(DISABLED)
+            self._set_progress(0)
+            self._set_status("批量打包中 (共 %d 个)..." % total)
+            self.log_text.config(state=NORMAL)
+            self.log_text.delete("1.0", END)
+            self.log_text.config(state=DISABLED)
+            self._log("========== 批量打包开始 (共 %d 个文件夹) ==========" % total)
+        except Exception as e:
+            self._set_build_buttons_state(NORMAL)
+            self._building = False
+            # log_text 可能停在 NORMAL（可编辑），必须恢复只读
+            try:
+                self.log_text.config(state=DISABLED)
+            except Exception:
+                pass
+            messagebox.showerror("错误", "界面初始化失败，无法开始批量打包:\n%s" % e)
+            return
 
         def run_batch():
             results = []
@@ -1745,7 +1866,7 @@ class PackagerApp:
                 def finish():
                     messagebox.showinfo("批量打包完成",
                                         "成功: %d / %d\n详见日志。" % (ok_count, total))
-                self.root.after(0, finish)
+                self._call_in_ui(finish)
             except Exception as e:
                 # 意外异常也要写日志，不能让线程静默死亡
                 try:
@@ -1758,10 +1879,7 @@ class PackagerApp:
                 def _reset():
                     self._building = False
                     self._set_build_buttons_state(NORMAL)
-                try:
-                    self.root.after(0, _reset)
-                except Exception:
-                    pass
+                self._call_in_ui(_reset)
 
         try:
             threading.Thread(target=run_batch, daemon=True).start()
@@ -1785,7 +1903,7 @@ class PackagerApp:
         history.insert(0, entry)
         self.cfg["build_history"] = history[:BUILD_HISTORY_MAX]
         save_config(self.cfg)
-        self.root.after(0, self._refresh_build_history)
+        self._call_in_ui(self._refresh_build_history)
 
     def _refresh_build_history(self):
         for item in self.history_tree.get_children():
@@ -2220,7 +2338,7 @@ class PackagerApp:
                 self._set_status("扫描完成: %d 个文件, %s" % (len(files), format_size(total_size)))
                 self._update_stats()
 
-            self.root.after(0, update_ui)
+            self._call_in_ui(update_ui)
 
         threading.Thread(target=scan_thread, daemon=True).start()
 

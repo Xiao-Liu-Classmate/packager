@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 主目标平台为 Windows；Linux 用于兜底纯函数/CLI 测试
+        os: [windows-latest, ubuntu-latest]
+        python-version: ["3.8", "3.10", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Syntax check
+        run: python -c "import py_compile; py_compile.compile('packager.py', doraise=True); py_compile.compile('test_packager.py', doraise=True)"
+
+      - name: Run unit tests
+        run: python -m pytest test_packager.py -v --tb=short
+
+      - name: CLI smoke test
+        run: |
+          python packager.py --list-modes
+          python packager.py --help
+        shell: bash
+
+  # 7-Zip / Inno / NSIS 均为 Windows GUI 工具，
+  # 真实编译验证需人工在装有这些工具的机器上执行。
+  compile-smoke:
+    name: Manual compile smoke (placeholder)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - name: Check Inno Setup availability
+        run: |
+          $paths = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+          )
+          $found = $paths | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($found) { Write-Output "ISCC: $found" } else { Write-Output "Inno Setup not installed on runner (expected)" }
+        shell: pwsh
