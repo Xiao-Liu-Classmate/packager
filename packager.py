@@ -32,6 +32,11 @@ MODE_NAMES = {"inno": "Inno Setup", "7zip": "7-Zip SFX",
               "zip": "ZIP", "nsis": "NSIS"}
 CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".packager_config.json")
 PROJECT_EXTENSIONS = [("Packager 项目文件", "*.packager"), ("所有文件", "*.*")]
+# 项目镜像地址（"关于"对话框与文档共用，避免出现占位链接）
+REPO_URLS = (
+    ("GitHub", "https://github.com/Xiao-Liu-Classmate/packager"),
+    ("Gitee", "https://gitee.com/xiao-xiao-liuA/packager"),
+)
 
 DEFAULT_CONFIG = {
     "last_source": "",
@@ -510,8 +515,10 @@ def build_with_7zip(cfg, log_callback, progress_callback):
     log_callback("创建7z压缩包...")
     progress_callback(20)
     try:
+        # -r 显式递归：避免依赖 `dir\*` 通配符的隐式递归行为，
+        # 确保所有层级的子目录都进包（与 scan_folder 全深度扫描一致）
         cmd_create = [sz, "a", "-t7z", "-m0=lzma2", "-mx=%s" % compression_level,
-                      "-mmt=on"] + exclude_args + [
+                      "-mmt=on", "-r"] + exclude_args + [
                       "%s.7z" % archive_path,
                       "%s\\*" % source]
         result = subprocess.run(
@@ -1131,7 +1138,9 @@ class PackagerApp:
         self.recent_menu.add_command(label="清除最近项目列表", command=self._clear_recent_projects)
 
     def _add_recent_project(self, filepath):
-        recent = self.cfg.get("recent_projects", [])
+        # 必须先复制再改：load_config() 用 DEFAULT_CONFIG.copy()（浅拷贝），
+        # 原地 remove/insert 会连带改掉模块级 DEFAULT_CONFIG 里的同一 list
+        recent = list(self.cfg.get("recent_projects", []))
         if filepath in recent:
             recent.remove(filepath)
         recent.insert(0, filepath)
@@ -1897,7 +1906,18 @@ class PackagerApp:
     # J. Build History
     # ============================================================
     def _add_build_history(self, mode, app_name, output_file, success):
-        history = self.cfg.get("build_history", [])
+        """线程安全入口：批量打包会在 worker 线程调用。
+
+        cfg["build_history"] 的写入与 UI 刷新必须同处主线程，
+        否则主线程遍历该 list 时被 worker insert 会抛
+        "list changed size during iteration"。
+        """
+        self._call_in_ui(self._add_build_history_sync, mode, app_name,
+                         output_file, success)
+
+    def _add_build_history_sync(self, mode, app_name, output_file, success):
+        """实际写入逻辑，仅在主线程执行"""
+        history = list(self.cfg.get("build_history", []))
         entry = {
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "app_name": app_name,
@@ -1908,12 +1928,13 @@ class PackagerApp:
         history.insert(0, entry)
         self.cfg["build_history"] = history[:BUILD_HISTORY_MAX]
         save_config(self.cfg)
-        self._call_in_ui(self._refresh_build_history)
+        self._refresh_build_history()
 
     def _refresh_build_history(self):
         for item in self.history_tree.get_children():
             self.history_tree.delete(item)
-        for entry in self.cfg.get("build_history", []):
+        # 迭代前快照，避免遍历过程中被改写
+        for entry in list(self.cfg.get("build_history", [])):
             self.history_tree.insert("", "end", values=(
                 entry.get("time", ""),
                 entry.get("app_name", ""),
@@ -2109,11 +2130,13 @@ class PackagerApp:
 
         ttk.Separator(content, orient="horizontal").pack(fill=X, pady=8)
 
-        Label(content, text="下载链接:", font=("Microsoft YaHei UI", 10, "bold"), anchor=W).pack(fill=X, pady=(0, 2))
-        link = Label(content, text="https://github.com/example/packager",
-                     font=("Microsoft YaHei UI", 9), foreground="blue", cursor="hand2")
-        link.pack(anchor=W)
-        link.bind("<Button-1>", lambda e: self._open_url("https://github.com/example/packager"))
+        Label(content, text="项目主页:", font=("Microsoft YaHei UI", 10, "bold"), anchor=W).pack(fill=X, pady=(0, 2))
+        for _name, _url in REPO_URLS:
+            link = Label(content, text=_url,
+                         font=("Microsoft YaHei UI", 9), foreground="blue", cursor="hand2")
+            link.pack(anchor=W)
+            # 默认参数绑定，避免闭包捕获最后一个循环变量
+            link.bind("<Button-1>", lambda e, u=_url: self._open_url(u))
 
         ttk.Button(content, text="关闭", command=about_win.destroy).pack(pady=(12, 0))
 
@@ -2131,9 +2154,13 @@ class PackagerApp:
             self.cfg["pre_install_cmd"] = self.pre_install_var.get()
             self.cfg["post_install_cmd"] = self.post_install_var.get()
             self.cfg["batch_sources"] = list(self.batch_listbox.get(0, END))
-            self.cfg["window_width"] = self.root.winfo_width()
-            self.cfg["window_height"] = self.root.winfo_height()
             self.cfg["last_project_file"] = self.current_project
+            # 窗口尺寸只是记忆项，读取失败不应连带跳过 save_config
+            try:
+                self.cfg["window_width"] = self.root.winfo_width()
+                self.cfg["window_height"] = self.root.winfo_height()
+            except Exception:
+                pass
             save_config(self.cfg)
         except Exception:
             pass

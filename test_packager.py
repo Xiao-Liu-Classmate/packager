@@ -456,19 +456,64 @@ def test_7zip_exclude_args_empty_and_blank():
     assert pk.build_7zip_exclude_args(" a/b ") == ["-xr!a/b", "-xr!*a/b"]
 
 
+def test_7zip_cmd_places_all_switches_before_archive(tmp_path, monkeypatch):
+    """7-Zip 要求所有开关位于归档名之前，否则 -r 会被当成文件名。
+
+    本机无 7-Zip 无法实测编译行为，这里从命令构造上锁定参数顺序。
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _base_cfg(last_source=str(src), last_output=str(out),
+                    exclude_patterns="__pycache__", app_name="Demo")
+
+    captured = {}
+
+    def fake_run(cmd, **kw):
+        captured["cmd"] = list(cmd)
+        raise RuntimeError("stop-after-capture")
+
+    monkeypatch.setattr(pk, "find_7zip", lambda: r"C:\Program Files\7-Zip\7z.exe")
+    monkeypatch.setattr(pk.subprocess, "run", fake_run)
+
+    pk.build_with_7zip(cfg, lambda m: None, lambda v: None)
+
+    cmd = captured["cmd"]
+    archive_idx = [i for i, a in enumerate(cmd) if a.endswith(".7z")]
+    assert archive_idx, "未找到归档名参数"
+    archive_idx = archive_idx[0]
+    for sw in ("-r", "-t7z", "-mx=9", "-mmt=on",
+               "-xr!__pycache__", "-xr!*__pycache__"):
+        assert sw in cmd, "缺少开关: %s" % sw
+        assert cmd.index(sw) < archive_idx, "%s 必须位于归档名之前" % sw
+    # 源路径在归档名之后（作为要打包的内容）
+    assert cmd.index("%s\\*" % str(src)) > archive_idx
+
+
 # ------------------------------------------------------------
 # GUI 重入与按钮状态回归（上一轮 HIGH-1）
 # ------------------------------------------------------------
 @pytest.fixture(scope="module")
-def app(request):
-    """实例化 GUI；无显示环境时跳过"""
+def app(tmp_path_factory):
+    """实例化 GUI；无显示环境时跳过。
+
+    CONFIG_FILE 指向临时目录：GUI 用例不得读写开发者真实的
+    ~/.packager_config.json（既避免污染，也避免受本机既有设置影响）。
+    """
+    home = tmp_path_factory.mktemp("packager_home")
+    original_cfg = pk.CONFIG_FILE
+    pk.CONFIG_FILE = str(home / ".packager_config.json")
     try:
-        root = pk.Tk()
-    except Exception as exc:  # pragma: no cover
-        pytest.skip("无法创建 Tk 根窗口: %s" % exc)
-    root.withdraw()
-    instance = pk.PackagerApp(root)
-    yield instance, root
+        try:
+            root = pk.Tk()
+        except Exception as exc:  # pragma: no cover
+            pytest.skip("无法创建 Tk 根窗口: %s" % exc)
+        root.withdraw()
+        instance = pk.PackagerApp(root)
+        yield instance, root
+    finally:
+        pk.CONFIG_FILE = original_cfg
     try:
         root.destroy()
     except Exception:
@@ -536,8 +581,24 @@ def test_call_in_ui_runs_inline_on_main_thread(app):
     assert instance._ui_queue.empty()
 
 
-def test_call_in_ui_queues_from_worker_thread(app):
+@pytest.fixture
+def pollable(app, monkeypatch):
+    """手工调用 _poll_ui_queue 的用例专用。
+
+    1. 屏蔽 root.after：避免每次 poll 都真实注册一条新调度链；
+       app 是 module 级共享 fixture，多条并行链会同时消费队列。
+    2. 屏蔽 save_config：这几个用例会首次让 GUI 测试链路走到落盘，
+       若不拦截会往开发者真实的 ~/.packager_config.json 写入垃圾数据
+       （build_history 累积 app_name="App" 的假记录）。
+    """
     instance, _root = app
+    monkeypatch.setattr(instance.root, "after", lambda *a, **k: None)
+    monkeypatch.setattr(pk, "save_config", lambda *a, **k: None)
+    return instance
+
+
+def test_call_in_ui_queues_from_worker_thread(pollable):
+    instance = pollable
     seen = []
 
     def worker():
@@ -555,9 +616,9 @@ def test_call_in_ui_queues_from_worker_thread(app):
     assert seen == ["from-thread"], "_poll_ui_queue 未消费队列"
 
 
-def test_poll_ui_queue_survives_broken_callback(app, capsys):
+def test_poll_ui_queue_survives_broken_callback(pollable, capsys):
     """单条回调抛异常不得中断轮询，也不能阻塞后续回调"""
-    instance, _root = app
+    instance = pollable
     seen = []
     instance._ui_queue.put((lambda: 1 / 0, (), {}))
     instance._ui_queue.put((seen.append, ("ok",), {}))
@@ -577,16 +638,62 @@ def test_poll_ui_queue_reschedules_itself(app, monkeypatch):
     assert calls == [30], "轮询未按 30ms 重新调度自身"
 
 
-def test_poll_ui_queue_budget_caps_work(app, capsys):
+def test_add_build_history_defers_to_ui_thread(pollable):
+    """核心并发修复的回归测试。
+
+    build_history 的 list 若在 worker 线程被 insert，而主线程同时遍历刷新
+    Treeview，会抛 "list changed size during iteration"。因此
+    _add_build_history 必须把写入整体推迟到主线程。
+    """
+    instance = pollable
+    assert instance._ui_queue.empty(), "前置用例未清理队列"
+    before = len(instance.cfg.get("build_history", []))
+
+    t = threading.Thread(target=lambda: instance._add_build_history(
+        "ZIP", "App", "out.7z", True))
+    t.start()
+    t.join(timeout=5)
+
+    # worker 线程不得直接改 cfg，只能入队
+    assert len(instance.cfg.get("build_history", [])) == before
+    assert not instance._ui_queue.empty()
+
+    instance._poll_ui_queue()
+    assert len(instance.cfg.get("build_history", [])) == before + 1
+
+
+def test_add_build_history_copies_list_not_mutates_shared_default(pollable):
+    """写入前必须复制 list，否则会就地改动 DEFAULT_CONFIG 里的共享对象"""
+    instance = pollable
+    # 故意让 cfg 指向 DEFAULT_CONFIG 的同一个 list（模拟 load_config 浅拷贝）
+    instance.cfg["build_history"] = pk.DEFAULT_CONFIG["build_history"]
+    instance._add_build_history("ZIP", "App", None, True)
+    # 模块级默认值不得被污染
+    assert pk.DEFAULT_CONFIG["build_history"] == [], "污染了 DEFAULT_CONFIG 共享 list"
+    # 而 cfg 本身应被替换为新 list 并记录本次
+    assert len(instance.cfg["build_history"]) == 1
+    assert instance.cfg["build_history"] is not pk.DEFAULT_CONFIG["build_history"]
+
+
+def test_add_recent_project_copies_list(pollable):
+    """recent_projects 同理：原地 remove/insert 会污染 DEFAULT_CONFIG"""
+    instance = pollable
+    instance.cfg["recent_projects"] = pk.DEFAULT_CONFIG["recent_projects"]
+    instance._add_recent_project(r"D:\some\p.packager")
+    assert pk.DEFAULT_CONFIG["recent_projects"] == [], "污染了 DEFAULT_CONFIG 共享 list"
+    assert instance.cfg["recent_projects"] == [r"D:\some\p.packager"]
+
+
+def test_poll_ui_queue_budget_caps_work(pollable, capsys):
     """单 tick 不得无上限消费，否则突发日志会卡住界面"""
-    instance, _root = app
+    instance = pollable
     budget = instance._UI_QUEUE_BUDGET
     assert isinstance(budget, int) and budget > 0
     done = []
     for i in range(budget + 20):
         instance._ui_queue.put((done.append, (i,), {}))
     instance._poll_ui_queue()
-    assert len(done) <= budget, "超出预算仍继续消费"
+    assert len(done) == budget, "单 tick 消费数应恰为预算上限"
     assert not instance._ui_queue.empty(), "剩余回调应留到下一 tick"
     # 清空，避免影响其他用例
     instance._poll_ui_queue()
@@ -594,7 +701,12 @@ def test_poll_ui_queue_budget_caps_work(app, capsys):
 
 
 def test_helper_ui_wrappers_route_through_call_in_ui(app, monkeypatch):
-    """_log/_set_progress/_set_status/_add_build_history 须走 _call_in_ui"""
+    """_log/_set_progress/_set_status 须经 _call_in_ui 调度。
+
+    注意：_add_build_history 的路由不能用本用例断言——它已被
+    _call_in_ui 整体替换掉，调用必然"被路由"，测不出真实行为；
+    其并发语义由 test_add_build_history_defers_to_ui_thread 覆盖。
+    """
     instance, _root = app
     routed = []
     monkeypatch.setattr(instance, "_call_in_ui",

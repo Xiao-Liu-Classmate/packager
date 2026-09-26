@@ -1,5 +1,9 @@
 # 一键打包工具 v4.3.0
 
+[![CI](https://github.com/Xiao-Liu-Classmate/packager/actions/workflows/ci.yml/badge.svg)](https://github.com/Xiao-Liu-Classmate/packager/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 把文件夹打包成 `.exe` 安装包，带图形界面与命令行两种用法。
 
 ## 快速开始
@@ -95,6 +99,13 @@ python -m pytest test_packager.py -v
 
 覆盖版本号规范化、路径/脚本字段校验、四种模式的排除语义、CLI 参数优先级、
 配置原子写与损坏恢复、ZIP 产物完整性、GUI 重入保护与按钮状态恢复。
+
+## 仓库镜像
+
+本项目同时维护两个镜像，内容保持一致：
+
+- GitHub：<https://github.com/Xiao-Liu-Classmate/packager>
+- Gitee：<https://gitee.com/xiao-xiao-liuA/packager>
 
 ## 系统要求
 
