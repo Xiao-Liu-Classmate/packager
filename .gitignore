@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 测试与工具缓存
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini
+
+# 打包产物与本地运行时数据
+*.zip
+*.7z
+*.exe
+*.part
+dist/
+build/
+output/
+*.log
+
+# 本地配置
+.packager
+*.bak
