@@ -880,6 +880,7 @@ def test_edge_mask_is_transpose_symmetric():
         assert m.getpixel(p) >= 220, "边缘遮罩未饱和: %s=%d" % (p, m.getpixel(p))
 
 
+@pytest.mark.skipif(not pk.GLASS_AVAILABLE, reason="未安装 Pillow")
 def test_render_glass_card_accepts_legacy_shadow_kwarg():
     """旧调用方可能传 shadow=，兼容包装不得抛 TypeError"""
     img = pk.render_glass_card(120, 80, pk.GLASS_PALETTES["dark"],
