@@ -921,17 +921,26 @@ def _ui_warn(msg, once_key=None):
 GLASS_PALETTES = {
     "dark": {
         "name": "深色",
-        "bg_top": (10, 15, 31),
-        "bg_bottom": (22, 28, 54),
+        "bg_top": (14, 21, 43),
+        "bg_bottom": (26, 34, 64),
         # 光斑铺在中央区域：整窗大卡片会盖住四角，靠中央才透得出来
         "blobs": (
-            (0.50, 0.06, 0.62, (56, 189, 248), 74),
-            (0.12, 0.42, 0.46, (139, 92, 246), 66),
-            (0.88, 0.52, 0.46, (37, 99, 235), 62),
-            (0.42, 0.96, 0.52, (16, 185, 129), 52),
-            (0.72, 0.24, 0.34, (236, 72, 153), 40),
+            (0.50, 0.05, 0.66, (72, 205, 255), 118),
+            (0.10, 0.44, 0.50, (167, 110, 255), 104),
+            (0.90, 0.54, 0.50, (59, 130, 255), 100),
+            (0.40, 0.98, 0.54, (45, 212, 191), 84),
+            (0.74, 0.22, 0.38, (244, 114, 182), 70),
+            # 中部补两团弱光：内容区的大卡片正压在窗口中部，
+            # 没有它们卡片内部会是一整片死板的深蓝，透光感看不出来
+            (0.30, 0.62, 0.42, (96, 156, 255), 46),
+            (0.66, 0.40, 0.38, (150, 110, 245), 40),
         ),
         # 卡片填充刻意很淡：半透明越高越像"实色面板"，越低才透出环境光
+        # 玻璃光学参数：blur 磨砂强度 / chroma 边缘色散像素 /
+        # tint 玻璃染色 / sheen 镜面高光 / edge_light 边缘光圈
+        "glass": {"blur": 5.0, "edge_blur": 4.0, "chroma": 4.2,
+                  "tint": 0.08, "sheen": 0.22, "edge_light": 0.38,
+                  "gain": 1.55},
         "surface": (24, 31, 58),
         "card_fill": (255, 255, 255, 26),
         # 暗背景下 1px 亮描边会被放大成刺眼白线，压到几乎不可见，
@@ -959,12 +968,21 @@ GLASS_PALETTES = {
         "bg_top": (238, 243, 254),
         "bg_bottom": (215, 224, 246),
         "blobs": (
-            (0.50, 0.04, 0.60, (125, 211, 252), 132),
-            (0.10, 0.40, 0.44, (167, 139, 250), 112),
-            (0.90, 0.50, 0.44, (147, 197, 253), 128),
-            (0.40, 0.98, 0.50, (134, 239, 172), 104),
-            (0.74, 0.22, 0.32, (251, 207, 232), 96),
+            (0.50, 0.03, 0.64, (165, 232, 255), 172),
+            (0.08, 0.42, 0.48, (196, 168, 255), 156),
+            (0.92, 0.52, 0.48, (170, 208, 255), 168),
+            (0.38, 0.99, 0.54, (167, 247, 208), 146),
+            (0.76, 0.20, 0.36, (253, 216, 238), 132),
+            # 中部补两团弱光：内容区的大卡片正压在窗口中部，
+            # 没有它们卡片内部会是一整片死板的纯色，透光感看不出来。
+            # 浅色主题底色接近白(约223,231,249)，必须用高饱和色 + 高强度，
+            # 否则合成后的偏移不足 3/255，肉眼完全看不出（等于白加）
+            (0.30, 0.64, 0.42, (150, 176, 255), 132),
+            (0.68, 0.42, 0.38, (206, 158, 255), 118),
         ),
+        "glass": {"blur": 6.0, "edge_blur": 5.0, "chroma": 4.4,
+                  "tint": 0.10, "sheen": 0.30, "edge_light": 0.52,
+                  "gain": 1.10},
         "surface": (232, 238, 250),
         "card_fill": (255, 255, 255, 150),
         "card_border": (255, 255, 255, 150),
@@ -1073,67 +1091,201 @@ def render_aurora_background(width, height, palette):
         radius=max(1.0, min(4.0, width / 400.0))))
 
 
-def render_glass_card(width, height, palette, radius=18, surface=None,
-                       shadow=True):
-    """渲染一张玻璃卡片。
+# 玻璃光学参数白名单：palettes["glass"] 只允许这些键，
+# 避免未来加键时与 render_liquid_glass 的 radius/surface 形参冲突
+_GLASS_OPTICAL_KEYS = frozenset(
+    ("blur", "edge_blur", "chroma", "tint", "sheen", "edge_light", "gain"))
 
-    重要：Tk 的 PhotoImage 会**丢弃 alpha 通道只显示 RGB**，因此不能把
-    "纯色 + 低 alpha" 的像素直接交给它——描边会变成刺眼的纯白线。
-    这里改为在 PIL 内部把半透明图层与底色 surface 合成完毕，
-    最终输出一张完全不透明的 RGB 图：视觉上仍是半透明玻璃，
-    但不再依赖 Tk 的 alpha 支持。
+
+def _radial_edge_mask(width, height, inner=0.30, outer=0.92, gamma=1.7):
+    """边缘遮罩：中心 0 -> 边缘 255，驱动边缘折射与色散。
+
+    距离度量用**归一化的切比雪夫距离**（离最近边的相对距离）。它的等值线是
+    **同心矩形**，水平内缩 (1-t)*cx、垂直内缩 (1-t)*cy，因此宽扁面板的四条边
+    强度一致。
+
+    这里必须画矩形而不是圆：欧氏/等半径圆在宽扁面板上会直接落到画布外
+    （600x300 时最大圆半径仅 150，左右边 x<150 处永远落空 → 无色散），
+    底部的宽扁操作条与日志条恰好都是这种形状。
+    """
+    m = Image.new("L", (width, height), 0)
+    d = ImageDraw.Draw(m)
+    cx, cy = width / 2.0, height / 2.0
+    steps = 64
+    for i in range(steps, 0, -1):
+        t = i / float(steps)
+        if t <= inner:
+            a = 0
+        elif t >= outer:
+            a = 255
+        else:
+            a = int(255 * ((t - inner) / (outer - inner)) ** gamma)
+        if a <= 0:
+            continue
+        ix = cx * (1.0 - t)
+        iy = cy * (1.0 - t)
+        d.rectangle([ix, iy, width - ix, height - iy], fill=a)
+    # 模糊半径按**短边**取：按长边取会在极扁面板（日志条约 1000x40）上
+    # 把上下两条边互相抹平，导致四边强度再次失衡
+    return m.filter(ImageFilter.GaussianBlur(
+        radius=max(2, min(width, height) // 90)))
+
+
+def render_liquid_glass(width, height, palette, bg_img=None, bg_box=None,
+                        radius=18, surface=None, blur=6.0, edge_blur=4.0,
+                        chroma=3.4, tint=0.09, sheen=0.22, edge_light=0.65,
+                        gain=1.0):
+    """渲染一张**真正的**液态玻璃卡片，返回不透明 RGB。
+
+    构成（对应 Apple Liquid Glass 的真实光学行为）：
+      1. 透光：取卡片下方的真实背景，而不是盖一层假半透明色
+      2. 磨砂：高斯模糊背景
+      3. 色散：边缘处 R/B 通道反向偏移，形成红蓝分离的彩色边
+      4. 边缘散焦：边缘比中心更糊（玻璃曲率折射导致）
+      5. 玻璃色调：极轻的白色叠加，模拟玻璃吸收
+      6. 镜面高光：斜向亮带
+      7. 边缘光圈：玻璃切口把光聚焦到边缘（渐变而非均匀白线）
+
+    不用 MESH 网格变换做整体形变——相邻 quad 之间会留下接缝，
+    这里用「强模糊 + 边缘色散」达到近似的折射观感且无伪影。
+
+    输出不透明 RGB 的原因：Tk 的 PhotoImage 会丢弃 alpha 通道
+    只显示 RGB，直接交付带低 alpha 的像素会让描边变成刺眼纯白线。
     """
     width, height = _clamp_render_size(width, height)
-    radius = max(2, min(int(radius), min(width, height) // 2))
     if surface is None:
-        surface = tuple(palette["bg_bottom"][:3])
+        surface = tuple(palette["surface"][:3])
 
-    base = Image.new("RGB", (width, height), surface)
+    # 主体（取景 / 模糊 / 色散 / 散焦）一律在 1/2 分辨率上做再上采样：
+    # 这些步骤都是低频信息，降采样后像素数只剩 1/4，耗时约为 1/4，
+    # 而高光与边缘光圈仍按全分辨率绘制以保持锐利。
+    dw, dh = max(8, width // 2), max(8, height // 2)
+    inv = 0.5  # 下采样倍率
 
-    pad = 14 if shadow else 0
-    cw = max(4, width - pad * 2)
-    ch = max(4, height - pad * 2)
+    # 1) 底层：优先用真实背景，其次退化为纯色
+    if bg_img is not None and bg_img.width >= 2 and bg_img.height >= 2:
+        box = list(bg_box or (0, 0, width, height))
+        if len(box) != 4:
+            box = [0, 0, width, height]
+        x0, y0, x1, y1 = [int(v) for v in box]
+        # 完全越界 -> 退化为纯色，避免被 clamp 成"边缘像素横向拉伸的条纹"
+        if x1 <= 0 or y1 <= 0 or x0 >= bg_img.width or y0 >= bg_img.height:
+            body = Image.new("RGB", (dw, dh), surface)
+        else:
+            x0 = max(0, min(x0, bg_img.width - 2))
+            y0 = max(0, min(y0, bg_img.height - 2))
+            x1 = max(x0 + 2, min(x1, bg_img.width))
+            y1 = max(y0 + 2, min(y1, bg_img.height))
+            if bg_img.mode != "RGB":
+                # RGBA/P 模式下 split() 的通道索引会错位，必须先转
+                bg_img = bg_img.convert("RGB")
+            body = bg_img.crop((x0, y0, x1, y1)).resize(
+                (dw, dh), Image.Resampling.BILINEAR)
+    else:
+        body = Image.new("RGB", (dw, dh), surface)
 
-    # 外阴影：圆角矩形做高斯模糊，再与底色合成
-    if shadow:
-        layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        ld = ImageDraw.Draw(layer)
-        ld.rounded_rectangle([pad, pad + 3, pad + cw, pad + ch],
-                             radius=radius, fill=palette["shadow"])
-        layer = layer.filter(ImageFilter.GaussianBlur(radius=7))
-        base = Image.alpha_composite(base.convert("RGBA"), layer).convert("RGB")
+    # 2) 磨砂
+    if blur > 0:
+        body = body.filter(ImageFilter.GaussianBlur(radius=blur * inv))
 
-    # 卡片本体
-    card = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    ImageDraw.Draw(card).rounded_rectangle(
-        [pad, pad, pad + cw, pad + ch], radius=radius,
-        fill=palette["card_fill"])
-    base = Image.alpha_composite(base.convert("RGBA"), card).convert("RGB")
+    # 2b) 透光增益：玻璃在明亮环境下会被环境光"点亮"，
+    # 不做增益时深色主题下卡片内部会显得死黑、失去通透感
+    if gain and abs(gain - 1.0) > 1e-3:
+        lut = [min(255, max(0, int(round(i * gain)))) for i in range(256)]
+        body = body.point(lut * 3)
 
-    # 顶部反光：玻璃特有的斜向高光带，裁剪在卡片轮廓内
-    sheen_h = max(1, int(ch * 0.45))
-    sheen = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    sd = ImageDraw.Draw(sheen)
-    a = palette["card_sheen"][3]
-    for y in range(sheen_h):
-        t = y / float(max(1, sheen_h - 1))
-        alpha = int(round(a * (1.0 - t) ** 1.6))
-        if alpha <= 0:
-            continue
-        sd.line([(pad, pad + y), (pad + cw, pad + y)],
-                fill=(255, 255, 255, alpha))
+    # 3) 边缘色散：R 向外、B 向内偏移，按径向遮罩在边缘加权。
+    #    位移量很小，用 BILINEAR 足够（BICUBIC 在此尺度慢 2.5 倍）。
+    emask = None
+    if chroma > 0:
+        emask = _radial_edge_mask(dw, dh)
+        c2 = chroma * inv
+        r_off = body.transform(
+            (dw, dh), Image.AFFINE,
+            (1, 0, c2, 0, 1, c2 * 0.35), resample=Image.Resampling.BILINEAR)
+        b_off = body.transform(
+            (dw, dh), Image.AFFINE,
+            (1, 0, -c2, 0, 1, -c2 * 0.35), resample=Image.Resampling.BILINEAR)
+        r_src, g_src, b_src = body.split()
+        # fallback 必须是**同名的原始通道**，不能用绿通道顶替：
+        # 若 R/B 都退化到 G，遮罩中心（占面板 60%+ 面积）会变成灰绿，
+        # 背景色相全部丢失，"真实折射"就名存实亡了。
+        # G 通道不参与偏移，直接原样保留，故只需一次 split()。
+        body = Image.merge("RGB", (
+            Image.composite(r_off.split()[0], r_src, emask),
+            g_src,
+            Image.composite(b_off.split()[2], b_src, emask),
+        ))
+
+    # 4) 边缘散焦
+    if edge_blur > 0:
+        if emask is None:
+            emask = _radial_edge_mask(dw, dh)
+        body = Image.composite(
+            body.filter(ImageFilter.GaussianBlur(radius=edge_blur * inv)),
+            body, emask)
+
+    # 5) 玻璃色调（极轻，避免发白失去通透感）
+    if tint > 0:
+        body = Image.blend(body, Image.new("RGB", (dw, dh),
+                                           (255, 255, 255)), tint)
+
+    # 6) 上采样回全分辨率 + 圆角遮罩
+    body = body.resize((width, height), Image.Resampling.BILINEAR)
+    radius = max(2, min(int(radius), min(width, height) // 2))
     mask = Image.new("L", (width, height), 0)
-    ImageDraw.Draw(mask).rounded_rectangle([pad, pad, pad + cw, pad + ch],
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, width - 1, height - 1],
                                            radius=radius, fill=255)
-    sheen.putalpha(ImageChops.multiply(sheen.split()[3], mask))
-    base = Image.alpha_composite(base.convert("RGBA"), sheen).convert("RGB")
+    result = Image.new("RGB", (width, height), surface)
+    result.paste(body, (0, 0), mask)
 
-    # 1px 高光描边（在已合成的底色上绘制，RGB 已是混合结果）
-    edge = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    ImageDraw.Draw(edge).rounded_rectangle(
-        [pad, pad, pad + cw - 1, pad + ch - 1], radius=radius,
-        outline=palette["card_border"], width=1)
-    return Image.alpha_composite(base.convert("RGBA"), edge).convert("RGB")
+    # 7) 镜面高光：斜向亮带
+    if sheen > 0:
+        hl = Image.new("L", (width, height), 0)
+        hd = ImageDraw.Draw(hl)
+        band = max(1, int(height * 0.62))
+        for y in range(band):
+            t = y / float(band - 1)
+            hd.line([(0, y), (width, int(y + height * 0.22))],
+                    fill=int(255 * (1 - t) ** 2.0 * sheen))
+        hl = hl.filter(ImageFilter.GaussianBlur(radius=max(6, height // 20)))
+        hl = ImageChops.multiply(hl, mask)
+        result = Image.composite(Image.new("RGB", (width, height),
+                                           (255, 255, 255)), result, hl)
+
+    # 8) 边缘光圈：沿轮廓的渐变亮环（角弱、上缘强），
+    #    均匀白线会变成刺眼"白框"，这正是上一版的观感问题
+    if edge_light > 0:
+        ring = Image.new("L", (width, height), 0)
+        rd = ImageDraw.Draw(ring)
+        inset = int(min(width, height) * 0.06)
+        rd.rounded_rectangle(
+            [inset, inset, width - 1 - inset, height - 1 - inset],
+            radius=max(2, radius - inset), outline=255, width=1)
+        # 上缘额外提亮，形成光照方向感
+        rd.line([(radius, 1), (width - radius, 1)],
+                fill=int(255 * 0.95), width=2)
+        ring = ring.filter(ImageFilter.GaussianBlur(radius=max(1.5, width / 260.0)))
+        ring = ImageChops.multiply(ring, mask)
+        ring = ring.point([min(255, int(v * edge_light)) for v in range(256)])
+        result = Image.composite(Image.new("RGB", (width, height),
+                                           (255, 255, 255)), result, ring)
+
+    return result
+
+
+# 兼容旧调用名（内部各处已统一用 render_liquid_glass）
+def render_glass_card(width, height, palette, radius=18, surface=None,
+                      shadow=True, **kw):
+    """兼容旧调用方的包装。
+
+    旧签名带 shadow 关键字，新渲染器不再有该参数，这里显式吞掉，
+    避免外部/旧代码以 shadow= 调用时抛 TypeError。
+    注意：投影改由上层容器（card_sheen/card_border）表达，
+    此函数不再绘制卡片投影。
+    """
+    return render_liquid_glass(width, height, palette, radius=radius,
+                              surface=surface, **kw)
 
 
 class GlassPanel(tk.Frame):
@@ -1146,11 +1298,15 @@ class GlassPanel(tk.Frame):
     REDRAW_DELAY_MS = 130
     MIN_SIZE = 12
     def __init__(self, master, app, radius=20, padding=16, title=None,
-                 hint=None, surface="card", **kw):
+                 hint=None, surface="card", edge_scale=1.0, **kw):
         tk.Frame.__init__(self, master, **kw)
         self.app = app
         self.radius = radius
         self.pad_in = padding
+        # 窄面板（底部操作卡片、收起的日志条）上，边缘光学带会被压缩到很短，
+        # 若不整体弱化，亮环与色散会像一道多余的白线/重影。
+        # 因此同时缩放边缘光、高光与色散（透光核心的 blur/gain 不动）。
+        self.edge_scale = edge_scale
         # "window" = 直接压在环境光背景上；"card" = 压在另一张玻璃卡片上
         self.surface_kind = surface
         self._photo = None
@@ -1226,13 +1382,35 @@ class GlassPanel(tk.Frame):
             pal = self.app.palette()
             base = (pal["surface"] if self.surface_kind == "window"
                     else self.app.card_bg_rgb())
-            img = render_glass_card(w, h, pal, radius=self.radius,
-                                    surface=base)
+            # 真正透光的关键：取卡片在窗口背景中的真实区域来折射，
+            # 而不是盖一层假的半透明色
+            bg_img, bg_box = self.app._glass_backdrop_crop(self, w, h)
+            # 白名单取值：若 palette 里混入 radius/surface 之类非光学键，
+            # **params 会抛"multiple values"TypeError 并被下面的宽 except
+            # 吞掉，导致面板静默保留旧图、极难定位
+            params = {k: v for k, v in pal.get("glass", {}).items()
+                      if k in _GLASS_OPTICAL_KEYS}
+            if self.edge_scale != 1.0:
+                # 遮罩改为四边对称后，扁条也会拿到完整色散，
+                # 因此 chroma 必须一起缩放，否则窄条上会出现明显红蓝重影
+                for key in ("edge_light", "sheen", "chroma"):
+                    if key in params:
+                        params[key] = params[key] * self.edge_scale
+            img = render_liquid_glass(
+                w, h, pal, bg_img=bg_img, bg_box=bg_box,
+                radius=self.radius, surface=base, **params)
             self._photo = ImageTk.PhotoImage(img)
             # 有 image 时 bg 不参与显示；传空串是非法颜色会抛 TclError
             self._bg.configure(image=self._photo)
         except Exception as exc:  # pragma: no cover - 渲染异常不应拖垮界面
-            _ui_warn("玻璃面板渲染失败: %s" % exc)
+            # redraw 由 Configure + 节流驱动，拖拽/缩放时调用频繁。
+            # 同一尺寸组合若持续失败会每秒刷屏，导致日志膨胀，故按消息去重
+            msg = "玻璃面板渲染失败: %s" % exc
+            if getattr(self, "_last_render_err", None) != msg:
+                self._last_render_err = msg
+                _ui_warn(msg)
+        else:
+            self._last_render_err = None
 
     def refresh_theme(self):
         self._sync_inner_bg()
@@ -1638,6 +1816,10 @@ class PackagerApp:
                     self._backdrop.configure(image="")
             except Exception:
                 pass
+            # 关闭时释放缓存，否则全窗口背景（1920x1080 约 6MB）
+            # 与 Tcl 侧副本会一直驻留内存
+            self._bg_pil = None
+            self._backdrop_img = None
             return
         w = self.root.winfo_width()
         h = self.root.winfo_height()
@@ -1645,10 +1827,39 @@ class PackagerApp:
             return
         try:
             img = render_aurora_background(w, h, self.palette())
+            # 缓存 PIL 原图：卡片折射时需要按位置取样真实背景
+            self._bg_pil = img
             self._backdrop_img = ImageTk.PhotoImage(img)
             self._backdrop.configure(image=self._backdrop_img)
         except Exception as exc:  # pragma: no cover
+            self._bg_pil = None
             _ui_warn("窗口背景渲染失败: %s" % exc)
+
+    def _glass_backdrop_crop(self, panel, w, h):
+        """取该面板在窗口背景中的对应区域，供玻璃折射取样。
+
+        锚点必须用铺满客户区的 _backdrop Label，不能用 root：
+        Tk 文档把 winfo_rootx/rooty 定义为 border（即外框）左上角，
+        而背景图尺寸取自 root.winfo_width/height（客户区），
+        直接相减会混进两套坐标系，非最大化窗口上整体偏移一个
+        (左边框, 标题栏高度)。_backdrop 与背景图同源，不受平台差异影响。
+        （实测部分 Windows 配置下两者恰好相等，但不能依赖该巧合。）
+        else 分支仅在 _backdrop 被显式置 None 时才会走到。
+        """
+        img = getattr(self, "_bg_pil", None)
+        if img is None:
+            return None, None
+        try:
+            anchor = self._backdrop
+            if anchor is not None:
+                ax, ay = anchor.winfo_rootx(), anchor.winfo_rooty()
+            else:
+                ax, ay = self.root.winfo_rootx(), self.root.winfo_rooty()
+            ox = panel.winfo_rootx() - ax
+            oy = panel.winfo_rooty() - ay
+            return img, (ox, oy, ox + w, oy + h)
+        except Exception:
+            return None, None
 
 
     # --- Menu Bar ---
@@ -2127,7 +2338,8 @@ class PackagerApp:
     def _build_bottom(self, parent):
         # 操作卡片：按钮 + 进度 + 状态压到两行，给内容区让出垂直空间
         action_panel = self.register_glass(
-            GlassPanel(parent, self, radius=20, padding=12))
+            GlassPanel(parent, self, radius=20, padding=12,
+                       edge_scale=0.5))
         action_panel.pack(fill=X, pady=(0, 10))
         row1 = ttk.Frame(action_panel.body)
         row1.pack(fill=X)
@@ -2158,7 +2370,8 @@ class PackagerApp:
         # 日志卡片：可折叠。默认收起以把垂直空间让给内容区；
         # 打包日志开始输出时会自动展开，用户也可手动切换。
         log_panel = self.register_glass(
-            GlassPanel(parent, self, radius=20, padding=12))
+            GlassPanel(parent, self, radius=20, padding=12,
+                       edge_scale=0.35))
         log_panel.pack(fill=X, pady=(0, 2))
         log_body = log_panel.body
 

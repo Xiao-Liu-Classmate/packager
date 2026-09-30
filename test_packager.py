@@ -783,9 +783,155 @@ def test_glass_card_output_is_opaque_rgb():
     低透明描边会在界面上变成刺眼纯白线。
     """
     for theme in ("dark", "light"):
-        img = pk.render_glass_card(220, 140, pk.GLASS_PALETTES[theme])
+        img = pk.render_liquid_glass(220, 140, pk.GLASS_PALETTES[theme])
         assert img.mode == "RGB", "%s 主题卡片不是 RGB" % theme
         assert img.size == (220, 140)
+
+
+@pytest.mark.skipif(not pk.GLASS_AVAILABLE, reason="未安装 Pillow")
+def test_liquid_glass_transmits_backdrop():
+    """真正的玻璃必须透出背景：给不同背景，卡片像素必须不同。"""
+    from PIL import Image
+    pal = pk.GLASS_PALETTES["dark"]
+    params = pal["glass"]
+    red = Image.new("RGB", (200, 200), (200, 20, 20))
+    blue = Image.new("RGB", (200, 200), (20, 20, 200))
+    a = pk.render_liquid_glass(200, 200, pal, bg_img=red,
+                               bg_box=(0, 0, 200, 200), **params)
+    b = pk.render_liquid_glass(200, 200, pal, bg_img=blue,
+                               bg_box=(0, 0, 200, 200), **params)
+    assert a.getpixel((100, 100)) != b.getpixel((100, 100)), \
+        "卡片未透出背景，不具备玻璃的透光性"
+
+
+@pytest.mark.skipif(not pk.GLASS_AVAILABLE, reason="未安装 Pillow")
+def test_liquid_glass_without_backdrop_falls_back_to_surface():
+    """没有背景图时退化为纯色，不能抛异常"""
+    pal = pk.GLASS_PALETTES["dark"]
+    img = pk.render_liquid_glass(160, 100, pal, bg_img=None, **pal["glass"])
+    assert img.mode == "RGB" and img.size == (160, 100)
+
+
+@pytest.mark.skipif(not pk.GLASS_AVAILABLE, reason="未安装 Pillow")
+def test_liquid_glass_chroma_produces_colored_edge():
+    """色散：边缘处 R 与 B 通道的差异应大于中心"""
+    from PIL import Image
+    pal = pk.GLASS_PALETTES["light"]
+    gray = Image.new("RGB", (240, 160), (128, 128, 128))
+    p = dict(pal["glass"])
+    img = pk.render_liquid_glass(240, 160, pal, bg_img=gray,
+                                 bg_box=(0, 0, 240, 160), **p)
+    r, g, b = img.split()
+    center = 120, 80
+    left = 4, 80
+    spread_center = abs(r.getpixel(center) - b.getpixel(center))
+    spread_edge = abs(r.getpixel(left) - b.getpixel(left))
+    assert spread_edge > spread_center, "边缘色散弱于中心，未产生折射彩边"
+
+
+@pytest.mark.skipif(not pk.GLASS_AVAILABLE, reason="未安装 Pillow")
+def test_palettes_define_glass_params():
+    """每套主题都要有完整的光学参数，且数值在合理区间"""
+    for theme, pal in pk.GLASS_PALETTES.items():
+        g = pal.get("glass")
+        assert isinstance(g, dict), "%s 缺少 glass 参数" % theme
+        for key in ("blur", "edge_blur", "chroma", "tint",
+                    "sheen", "edge_light", "gain"):
+            assert key in g, "%s.glass 缺少 %s" % (theme, key)
+        assert 0 <= g["tint"] <= 0.5, "tint 过大会让玻璃发白失去通透感"
+        assert 0 < g["gain"] <= 3.0
+        assert g["edge_light"] <= 1.0
+
+
+@pytest.mark.skipif(not pk.GLASS_AVAILABLE, reason="未安装 Pillow")
+def test_liquid_glass_center_keeps_backdrop_color():
+    """中心区必须保留背景原色相。
+
+    色散遮罩 emask 在中心为 0，此时 R/B 通道的 fallback 必须取**同名
+    原始通道**；若错用绿通道顶替，中心会退化成灰绿（(G,G,G)），
+    背景色相全部丢失。
+    """
+    from PIL import Image
+    pal = pk.GLASS_PALETTES["dark"]
+    bg = Image.new("RGB", (240, 200), (180, 40, 30))  # 明显的红棕背景
+    img = pk.render_liquid_glass(240, 200, pal, bg_img=bg,
+                                 bg_box=(0, 0, 240, 200), **pal["glass"])
+    r, g, b = img.getpixel((120, 100))
+    assert r > g + 30, "中心区红色通道被绿通道顶替，背景色相丢失 (R=%d G=%d)" % (r, g)
+    assert r > b + 30, "中心区失去红色优势 (R=%d B=%d)" % (r, b)
+
+
+@pytest.mark.skipif(not pk.GLASS_AVAILABLE, reason="未安装 Pillow")
+def test_edge_mask_is_transpose_symmetric():
+    """遮罩必须转置对称：宽扁与竖长面板的四边强度一致。
+
+    等价于「归一化切比雪夫距离」。旧实现画等半径圆，在 600x300 上最大圆
+    半径仅 150，左右边 x<150 处永远落空 -> 左右完全无色散。
+    注意不能用固定像素偏移取样比较（长轴与短轴的相对距离本就不同）。
+    """
+    m = pk._radial_edge_mask(600, 300)
+    t = pk._radial_edge_mask(300, 600)
+    for (x, y) in ((3, 150), (596, 150), (300, 3), (300, 296), (100, 60)):
+        assert abs(m.getpixel((x, y)) - t.getpixel((y, x))) <= 12, \
+            "遮罩转置不对称: (%d,%d)=%d vs %d" % (x, y, m.getpixel((x, y)),
+                                          t.getpixel((y, x)))
+    # 四边都必须达到饱和（255），否则短边拿不到边缘彩边
+    for p in ((3, 150), (596, 150), (300, 3), (300, 296)):
+        assert m.getpixel(p) >= 220, "边缘遮罩未饱和: %s=%d" % (p, m.getpixel(p))
+
+
+def test_render_glass_card_accepts_legacy_shadow_kwarg():
+    """旧调用方可能传 shadow=，兼容包装不得抛 TypeError"""
+    img = pk.render_glass_card(120, 80, pk.GLASS_PALETTES["dark"],
+                                radius=12, shadow=True)
+    assert img.size == (120, 80)
+
+
+@pytest.mark.skipif(not pk.GLASS_AVAILABLE, reason="未安装 Pillow")
+def test_glass_param_keys_are_whitelisted():
+    """palettes['glass'] 不得混入非光学键，否则 **params 会 TypeError"""
+    for theme, pal in pk.GLASS_PALETTES.items():
+        extra = set(pal["glass"]) - pk._GLASS_OPTICAL_KEYS
+        assert not extra, "%s.glass 含非白名单键: %s" % (theme, sorted(extra))
+
+
+@pytest.mark.skipif(not pk.GLASS_AVAILABLE, reason="未安装 Pillow")
+def test_liquid_glass_clamps_out_of_range_backdrop_box():
+    """背景框越界/尺寸非法时不得抛异常，退化为纯色或安全裁剪"""
+    from PIL import Image
+    pal = pk.GLASS_PALETTES["light"]
+    small = Image.new("RGB", (40, 40), (200, 200, 200))
+    for box in [(-999, -999, -500, -500), (0, 0, 40, 40), (0, 0)]:
+        img = pk.render_liquid_glass(60, 60, pal, bg_img=small,
+                                     bg_box=box, **pal["glass"])
+        assert img.size == (60, 60)
+
+
+@pytest.mark.skipif(not pk.GLASS_AVAILABLE, reason="未安装 Pillow")
+def test_liquid_glass_handles_non_rgb_backdrop():
+    """RGBA/P 模式背景必须先转 RGB，否则通道索引错位"""
+    from PIL import Image
+    pal = pk.GLASS_PALETTES["dark"]
+    rgba = Image.new("RGBA", (160, 160), (150, 60, 40, 255))
+    img = pk.render_liquid_glass(160, 160, pal, bg_img=rgba,
+                                 bg_box=(0, 0, 160, 160), **pal["glass"])
+    assert img.mode == "RGB" and img.size == (160, 160)
+
+
+def test_edge_scale_scales_glass_params():
+    """edge_scale 应按比例缩放边缘光圈、高光与色散
+
+    遮罩改为四边对称后扁条也会获得完整色散，因此 chroma 必须一并缩放，
+    否则窄条上会出现明显红蓝重影。
+    """
+    instance_params = {"edge_light": 0.4, "sheen": 0.2, "chroma": 4.0}
+    scale = 0.35
+    scaled = {k: v * scale for k, v in instance_params.items()}
+    assert abs(scaled["edge_light"] - 0.14) < 1e-9
+    assert abs(scaled["sheen"] - 0.07) < 1e-9
+    assert abs(scaled["chroma"] - 1.4) < 1e-9
+    # 透光核心参数不应被缩放
+    assert "blur" not in scaled and "gain" not in scaled
 
 
 @pytest.mark.skipif(not pk.GLASS_AVAILABLE, reason="未安装 Pillow")
