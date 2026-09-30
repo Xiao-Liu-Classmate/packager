@@ -7,10 +7,12 @@
 
 # 源码统一 LF（Git 侧），Windows 检出时按 core.autocrlf 转换
 *.py    text eol=lf
+*.spec  text eol=lf
 *.md    text eol=lf
 *.yml   text eol=lf
 *.yaml  text eol=lf
 *.json  text eol=lf
+*.txt   text eol=lf
 
 # 二进制文件不做转换
 *.png   binary

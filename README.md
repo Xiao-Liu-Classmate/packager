@@ -100,6 +100,30 @@ python -m pytest test_packager.py -v
 覆盖版本号规范化、路径/脚本字段校验、四种模式的排除语义、CLI 参数优先级、
 配置原子写与损坏恢复、ZIP 产物完整性、GUI 重入保护与按钮状态恢复。
 
+## 构建单文件 exe
+
+Release 上提供的 `packager.exe` 由本脚本构建：
+
+```bat
+build_exe.bat
+```
+
+脚本会依次：检测 Python（`python` → `py -3` 回退）→ 按 `requirements-build.txt`
+安装**锁定版本**的构建依赖 → 二次校验 PyInstaller 精确版本 → 运行单元测试
+（失败即阻断构建）→ 清理旧产物 → 打包 → 输出 `dist\packager.exe` 的大小、SHA256 与 Python 版本。
+
+关于构建参数：
+
+- **`packager.spec` 是构建参数的唯一真相源**。spec 存在时 PyInstaller 会**忽略**
+  命令行上的 `--onefile` / `--windowed` / `--name` 等选项，`build_exe.bat` 因此只传
+  `--clean --noconfirm`。想改构建行为请改 spec——改 bat 的命令行参数不会生效，且不会有任何提示。
+- `requirements-build.txt` 锁定了 PyInstaller **及其传递依赖**。只 pin PyInstaller 是不够的：
+  传递依赖浮动会让同一 PyInstaller 版本解析出不同依赖组合，产物随之漂移。
+- spec 中 `upx=False`：UPX 不在 PATH 时 PyInstaller 只打印 warning 并继续构建，
+  产物是否被压缩取决于构建机是否装了 UPX，跨机产物不一致。
+- 产物 SHA256 只对应**本次构建**。PyInstaller 会嵌入构建元数据，重新构建与线上版本
+  不是字节级一致属正常现象；把 SHA256 与 Python 版本一并写入 Release notes 即可校验。
+
 ## 仓库镜像
 
 本项目同时维护两个镜像，内容保持一致：
@@ -110,5 +134,5 @@ python -m pytest test_packager.py -v
 ## 系统要求
 
 - Windows 10/11
-- Python 3.8+
+- Python 3.8+（仅源码运行时需要；`packager.exe` 免安装）
 - 视打包模式另需 Inno Setup / NSIS / 7-Zip
