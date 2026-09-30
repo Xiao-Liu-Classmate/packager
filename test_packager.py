@@ -772,5 +772,166 @@ def test_save_config_cleans_real_tmp_on_replace_failure(tmp_path, monkeypatch, c
     assert not target.exists(), "失败时不应产生正式配置文件"
 
 
+# ------------------------------------------------------------
+# 液态玻璃设计系统
+# ------------------------------------------------------------
+@pytest.mark.skipif(not pk.GLASS_AVAILABLE, reason="未安装 Pillow")
+def test_glass_card_output_is_opaque_rgb():
+    """必须输出不透明 RGB。
+
+    Tk 的 PhotoImage 会丢弃 alpha 通道只显示 RGB，若这里回退成 RGBA，
+    低透明描边会在界面上变成刺眼纯白线。
+    """
+    for theme in ("dark", "light"):
+        img = pk.render_glass_card(220, 140, pk.GLASS_PALETTES[theme])
+        assert img.mode == "RGB", "%s 主题卡片不是 RGB" % theme
+        assert img.size == (220, 140)
+
+
+@pytest.mark.skipif(not pk.GLASS_AVAILABLE, reason="未安装 Pillow")
+def test_glass_card_alpha_is_opaque_everywhere():
+    """渲染结果不应残留半透明像素（含边缘与圆角外区域）"""
+    img = pk.render_glass_card(200, 120, pk.GLASS_PALETTES["dark"])
+    assert img.mode == "RGB"
+    # 角落（圆角外）应为底色本身
+    corner = img.getpixel((0, 0))
+    center = img.getpixel((100, 60))
+    assert corner != center, "圆角内外应可区分（阴影/填充）"
+
+
+@pytest.mark.skipif(not pk.GLASS_AVAILABLE, reason="未安装 Pillow")
+def test_aurora_background_size_and_mode():
+    for theme in ("dark", "light"):
+        img = pk.render_aurora_background(320, 200, pk.GLASS_PALETTES[theme])
+        assert img.mode == "RGB"
+        assert img.size == (320, 200)
+
+
+@pytest.mark.skipif(not pk.GLASS_AVAILABLE, reason="未安装 Pillow")
+def test_render_size_is_clamped():
+    """超大窗口必须被降采样，否则多屏铺开时内存会爆"""
+    w, h = pk._clamp_render_size(7680, 4320)
+    assert w <= pk.MAX_RENDER_W and h <= pk.MAX_RENDER_H
+    # 正常尺寸原样返回
+    assert pk._clamp_render_size(1200, 800) == (1200, 800)
+    # 极小尺寸不崩
+    assert pk._clamp_render_size(1, 1) == (4, 4)
+
+
+@pytest.mark.parametrize("given,expected_axes", [
+    ((0, 0), "both_min"),
+    ((-100, -50), "both_min"),
+    ((pk.MAX_RENDER_W, pk.MAX_RENDER_H), "exact"),
+    ((pk.MAX_RENDER_W + 1, 10), "width_only"),      # 单轴超限
+    ((10, pk.MAX_RENDER_H + 1), "height_only"),    # 单轴超限
+])
+def test_clamp_render_size_edges(given, expected_axes):
+    w, h = pk._clamp_render_size(*given)
+    assert w >= 4 and h >= 4
+    assert w <= pk.MAX_RENDER_W and h <= pk.MAX_RENDER_H
+    if expected_axes == "both_min":
+        assert (w, h) == (4, 4)
+    elif expected_axes == "exact":
+        # 恰好等于上限时不应被缩放
+        assert (w, h) == given
+    else:
+        # 单轴超限时另一轴也要等比缩小（不能只夹一轴导致比例失真）
+        assert (w, h) != given
+
+
+def test_clamp_render_size_preserves_aspect_ratio():
+    src_w, src_h = 5120, 1440
+    w, h = pk._clamp_render_size(src_w, src_h)
+    assert abs((w / float(h)) - (src_w / float(src_h))) < 0.05
+
+
+@pytest.mark.parametrize("alpha,expected", [
+    (0, (10, 20, 30)),
+    (255, (250, 250, 250)),
+    (128, (130, 135, 140)),
+])
+def test_mix_rgb_alpha_extremes(alpha, expected):
+    assert pk.mix_rgb((10, 20, 30), (250, 250, 250), alpha) == expected
+
+
+def test_mix_rgb_clamps_out_of_range():
+    assert pk.mix_rgb((0, 0, 0), (255, 255, 255), -50) == (0, 0, 0)
+    assert pk.mix_rgb((0, 0, 0), (255, 255, 255), 999) == (255, 255, 255)
+
+
+def test_rgb_to_hex():
+    assert pk.rgb_to_hex((0, 0, 0)) == "#000000"
+    assert pk.rgb_to_hex((255, 255, 255)) == "#ffffff"
+    assert pk.rgb_to_hex((91, 140, 255)) == "#5b8cff"
+    # 越界值应被夹紧而不是抛错
+    assert pk.rgb_to_hex((-5, 300, 128)) == "#00ff80"
+
+
+def test_palettes_have_required_keys():
+    required = ("bg_top", "bg_bottom", "blobs", "surface", "card_fill",
+                "card_border", "card_sheen", "shadow", "text", "text_dim",
+                "accent", "field", "hover", "press", "sel")
+    for theme, pal in pk.GLASS_PALETTES.items():
+        for key in required:
+            assert key in pal, "%s 主题缺少 %s" % (theme, key)
+        assert pal["name"]
+        assert len(pal["blobs"]) >= 3, "光斑太少，背景会显得平淡"
+
+
+def test_palette_colors_are_hex_strings():
+    """ttk 只接受 #rrggbb，元组会触发 unknown color name"""
+    for theme, pal in pk.GLASS_PALETTES.items():
+        for key in ("text", "text_dim", "accent", "accent2", "on_accent", "sel"):
+            v = pal[key]
+            assert isinstance(v, str) and v.startswith("#") and len(v) == 7, \
+                "%s.%s 不是合法 hex: %r" % (theme, key, v)
+
+
+def test_repo_urls_are_valid():
+    assert len(pk.REPO_URLS) >= 1
+    for name, url in pk.REPO_URLS:
+        assert name
+        assert url.startswith("https://")
+        assert "example" not in url, "仓库地址不应是占位符"
+
+
+def test_log_auto_expand_runs_on_main_thread(pollable, monkeypatch):
+    """回归测试：日志自动展开必须在主线程执行。
+
+    _log 会被后台打包线程调用（批量汇总含 "=========="）。若在调用者
+    线程直接操作 Tk 控件，tkinter 抛 RuntimeError 后被
+    _toggle_log_panel 内部的 except 吞掉——状态检查类断言会假通过，
+    所以这里用 spy 直接记录 _toggle_log_panel 的**调用线程**。
+    """
+    instance = pollable
+    if instance._log_expanded:
+        instance._toggle_log_panel()
+    assert instance._log_expanded is False
+
+    caller_threads = []
+    orig = instance._toggle_log_panel
+
+    def spy(*a, **k):
+        caller_threads.append(threading.current_thread())
+        return orig(*a, **k)
+
+    monkeypatch.setattr(instance, "_toggle_log_panel", spy)
+
+    t = threading.Thread(
+        target=lambda: instance._log("========== 批量打包结果 =========="))
+    t.start()
+    t.join(timeout=15)
+    assert not t.is_alive(), "worker 线程未退出"
+
+    # 关键：worker 线程绝不能触发展开（那会跨线程操作 Tk）
+    assert caller_threads == [], (
+        "_log 在 worker 线程调用了 _toggle_log_panel，构成跨线程 Tk 操作")
+
+    instance._poll_ui_queue()
+    assert caller_threads == [threading.main_thread()], (
+        "展开动作应由主线程执行")
+    assert instance._log_expanded is True
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

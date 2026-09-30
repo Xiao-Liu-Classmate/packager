@@ -13,6 +13,7 @@ import queue
 import traceback
 from pathlib import Path
 from datetime import datetime
+import tkinter as tk
 from tkinter import (Tk, Toplevel, Frame, Label, Button, Entry, StringVar,
                      IntVar, Text, filedialog, messagebox, N, S, E, W, LEFT,
                      RIGHT, TOP, BOTTOM, X, Y, BOTH, HORIZONTAL, DISABLED,
@@ -47,8 +48,8 @@ DEFAULT_CONFIG = {
     "default_mode": "inno",
     "icon_path": "",
     "exclude_patterns": "*.log,*.tmp,*.bak,Thumbs.db,.DS_Store,__pycache__,*.pyc,.git,.svn",
-    "window_width": 960,
-    "window_height": 780,
+    "window_width": 1180,
+    "window_height": 900,
     "last_icon_dir": "",
     "theme": "light",
     "recent_projects": [],
@@ -868,6 +869,377 @@ def build_with_nsis(cfg, log_callback, progress_callback):
 
 
 # ============================================================
+# UI. Liquid Glass Design System
+# ============================================================
+# Tkinter 原生控件没有圆角与半透明，这里用 Pillow 预渲染出
+# 「渐变环境光背景 + 半透明玻璃卡片 + 柔和阴影 + 高光描边」，
+# 再以 PhotoImage 铺在容器底层，从而在纯 Tk 下得到接近
+# Liquid Glass 的观感。
+#
+# 设计要点：
+#   1. 背景先在 1/8 尺寸上绘制渐变与光斑，再上采样放大并轻微模糊，
+#      避免逐像素计算导致启动变慢。
+#   2. ttk 控件只接受不透明颜色，因此卡片内的控件背景用
+#      mix_rgb() 把半透明填充"折算"成与背景混合后的等效实色，
+#      使控件与玻璃卡片在视觉上融为一体。
+#   3. Pillow 缺失时 GLASS_AVAILABLE 为 False，整体回退到
+#      扁平单色主题，界面依然完全可用。
+# ------------------------------------------------------------
+try:
+    from PIL import Image, ImageDraw, ImageFilter, ImageChops, ImageTk
+    GLASS_AVAILABLE = True
+    _PIL_IMPORT_ERROR = None
+except Exception as _exc:  # pragma: no cover - 环境缺 Pillow
+    Image = ImageDraw = ImageFilter = ImageChops = ImageTk = None
+    GLASS_AVAILABLE = False
+    _PIL_IMPORT_ERROR = str(_exc)
+
+UI_FONT = "Microsoft YaHei UI"
+UI_FONT_MONO = "Consolas"
+
+# 单次渲染的像素上限（见 _clamp_render_size）
+MAX_RENDER_W = 2560
+MAX_RENDER_H = 1600
+
+# UI 渲染类问题的去重告警，避免缩放窗口时刷屏
+_ui_warned = set()
+
+
+def _ui_warn(msg, once_key=None):
+    """向 stderr 报告 UI 层问题，并做去重，避免刷屏。"""
+    key = once_key or msg
+    if key in _ui_warned:
+        return
+    _ui_warned.add(key)
+    try:
+        print("[UI] %s" % msg, file=sys.stderr)
+    except Exception:
+        pass
+
+# 背景光斑：(相对位置x, 相对位置y, 半径倍数, 颜色, 峰值alpha)
+# 位置用 0~1 的比例，保证窗口缩放时光斑位置随之自适应。
+GLASS_PALETTES = {
+    "dark": {
+        "name": "深色",
+        "bg_top": (10, 15, 31),
+        "bg_bottom": (22, 28, 54),
+        # 光斑铺在中央区域：整窗大卡片会盖住四角，靠中央才透得出来
+        "blobs": (
+            (0.50, 0.06, 0.62, (56, 189, 248), 74),
+            (0.12, 0.42, 0.46, (139, 92, 246), 66),
+            (0.88, 0.52, 0.46, (37, 99, 235), 62),
+            (0.42, 0.96, 0.52, (16, 185, 129), 52),
+            (0.72, 0.24, 0.34, (236, 72, 153), 40),
+        ),
+        # 卡片填充刻意很淡：半透明越高越像"实色面板"，越低才透出环境光
+        "surface": (24, 31, 58),
+        "card_fill": (255, 255, 255, 26),
+        # 暗背景下 1px 亮描边会被放大成刺眼白线，压到几乎不可见，
+        # 靠阴影与顶部反光表达层次就够了
+        "card_border": (255, 255, 255, 12),
+        "card_sheen": (255, 255, 255, 20),
+        "shadow": (0, 0, 0, 120),
+        "text": "#E9EDF9",
+        "text_dim": "#98A3C2",
+        "accent": "#5B8CFF",
+        "accent2": "#8B5CF6",
+        "on_accent": "#FFFFFF",
+        "field": (255, 255, 255, 14),
+        "field_border": (255, 255, 255, 34),
+        "tree": (255, 255, 255, 10),
+        "tree_head": (255, 255, 255, 24),
+        "log": (7, 11, 24),
+        "hover": (255, 255, 255, 28),
+        "press": (255, 255, 255, 14),
+        "sel": "#4C6FE7",
+        "border_strong": (255, 255, 255, 30),
+    },
+    "light": {
+        "name": "浅色",
+        "bg_top": (238, 243, 254),
+        "bg_bottom": (215, 224, 246),
+        "blobs": (
+            (0.50, 0.04, 0.60, (125, 211, 252), 132),
+            (0.10, 0.40, 0.44, (167, 139, 250), 112),
+            (0.90, 0.50, 0.44, (147, 197, 253), 128),
+            (0.40, 0.98, 0.50, (134, 239, 172), 104),
+            (0.74, 0.22, 0.32, (251, 207, 232), 96),
+        ),
+        "surface": (232, 238, 250),
+        "card_fill": (255, 255, 255, 150),
+        "card_border": (255, 255, 255, 150),
+        "card_sheen": (255, 255, 255, 60),
+        "shadow": (30, 41, 82, 62),
+        "text": "#151A2C",
+        "text_dim": "#5A6483",
+        "accent": "#4C6FE7",
+        "accent2": "#7C5CFF",
+        "on_accent": "#FFFFFF",
+        "field": (223, 231, 248, 205),
+        "field_border": (255, 255, 255, 190),
+        "tree": (255, 255, 255, 126),
+        "tree_head": (255, 255, 255, 178),
+        "log": (250, 252, 255),
+        "hover": (236, 242, 253, 235),
+        "press": (206, 216, 238, 215),
+        "sel": "#4C6FE7",
+        "border_strong": (255, 255, 255, 190),
+    },
+}
+
+
+def mix_rgb(bg, fg, alpha):
+    """把半透明前景按 alpha 叠到不透明背景上，返回等效实色。
+
+    ttk 控件不接受 RGBA，玻璃卡片里的控件必须用这个函数把
+    卡片填充"折算"成实色，才能与半透明卡片视觉一致。
+    """
+    a = max(0.0, min(1.0, float(alpha) / 255.0))
+    return tuple(int(round(b + (f - b) * a)) for b, f in zip(bg, fg[:3]))
+
+
+def rgb_to_hex(rgb):
+    """(r,g,b) -> '#rrggbb'"""
+    return "#%02x%02x%02x" % tuple(max(0, min(255, int(c))) for c in rgb[:3])
+
+
+def _make_blob(size, color, max_alpha):
+    """生成一个径向衰减的圆形光斑（RGBA）。"""
+    blob = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(blob)
+    steps = 28
+    half = size / 2.0
+    for i in range(steps):
+        t = i / float(steps)
+        r = half * (1.0 - t)
+        if r <= 0.5:
+            break
+        # 平方衰减使中心更集中、边缘更柔和
+        alpha = int(round(max_alpha * (t ** 2.0)))
+        if alpha <= 0:
+            continue
+        draw.ellipse([half - r, half - r, half + r, half + r],
+                     fill=(color[0], color[1], color[2], alpha))
+    return blob
+
+
+def _clamp_render_size(width, height):
+    """把渲染尺寸限制在合理上限。
+
+    多屏铺开（7680x4320）时单个面板要同时持有多张全尺寸 RGBA 图，
+    峰值内存可达数百 MB 且主线程会被阻塞数秒。超限时按比例降采样，
+    显示时由 Tk 拉伸，视觉上几乎无差别。
+    """
+    w = max(4, int(width))
+    h = max(4, int(height))
+    if w <= MAX_RENDER_W and h <= MAX_RENDER_H:
+        return w, h
+    scale = min(MAX_RENDER_W / float(w), MAX_RENDER_H / float(h))
+    return max(4, int(w * scale)), max(4, int(h * scale))
+
+
+def render_aurora_background(width, height, palette):
+    """渲染窗口背景：多光斑环境光渐变。
+
+    先在 1/8 尺寸绘制再上采样，避免全尺寸逐像素运算。
+    """
+    width, height = _clamp_render_size(width, height)
+    sw = max(8, width // 8)
+    sh = max(8, height // 8)
+    top = palette["bg_top"]
+    bottom = palette["bg_bottom"]
+
+    base = Image.new("RGB", (sw, sh), bottom)
+    draw = ImageDraw.Draw(base)
+    for y in range(sh):
+        t = y / float(max(1, sh - 1))
+        draw.line([(0, y), (sw, y)],
+                  fill=tuple(int(round(top[i] + (bottom[i] - top[i]) * t))
+                             for i in range(3)))
+
+    # 叠加光斑
+    for fx, fy, rratio, color, alpha in palette["blobs"]:
+        size = max(8, int(min(sw, sh) * rratio * 2))
+        if size < 8:
+            continue
+        blob = _make_blob(size, color, alpha)
+        cx = int(fx * sw)
+        cy = int(fy * sh)
+        base.paste(blob, (cx - size // 2, cy - size // 2), blob)
+
+    img = base.resize((width, height), Image.Resampling.LANCZOS)
+    # 轻微模糊，消除上采样带来的轻微色带（半径封顶，避免大图上耗时过长）
+    return img.filter(ImageFilter.GaussianBlur(
+        radius=max(1.0, min(4.0, width / 400.0))))
+
+
+def render_glass_card(width, height, palette, radius=18, surface=None,
+                       shadow=True):
+    """渲染一张玻璃卡片。
+
+    重要：Tk 的 PhotoImage 会**丢弃 alpha 通道只显示 RGB**，因此不能把
+    "纯色 + 低 alpha" 的像素直接交给它——描边会变成刺眼的纯白线。
+    这里改为在 PIL 内部把半透明图层与底色 surface 合成完毕，
+    最终输出一张完全不透明的 RGB 图：视觉上仍是半透明玻璃，
+    但不再依赖 Tk 的 alpha 支持。
+    """
+    width, height = _clamp_render_size(width, height)
+    radius = max(2, min(int(radius), min(width, height) // 2))
+    if surface is None:
+        surface = tuple(palette["bg_bottom"][:3])
+
+    base = Image.new("RGB", (width, height), surface)
+
+    pad = 14 if shadow else 0
+    cw = max(4, width - pad * 2)
+    ch = max(4, height - pad * 2)
+
+    # 外阴影：圆角矩形做高斯模糊，再与底色合成
+    if shadow:
+        layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        ld = ImageDraw.Draw(layer)
+        ld.rounded_rectangle([pad, pad + 3, pad + cw, pad + ch],
+                             radius=radius, fill=palette["shadow"])
+        layer = layer.filter(ImageFilter.GaussianBlur(radius=7))
+        base = Image.alpha_composite(base.convert("RGBA"), layer).convert("RGB")
+
+    # 卡片本体
+    card = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    ImageDraw.Draw(card).rounded_rectangle(
+        [pad, pad, pad + cw, pad + ch], radius=radius,
+        fill=palette["card_fill"])
+    base = Image.alpha_composite(base.convert("RGBA"), card).convert("RGB")
+
+    # 顶部反光：玻璃特有的斜向高光带，裁剪在卡片轮廓内
+    sheen_h = max(1, int(ch * 0.45))
+    sheen = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(sheen)
+    a = palette["card_sheen"][3]
+    for y in range(sheen_h):
+        t = y / float(max(1, sheen_h - 1))
+        alpha = int(round(a * (1.0 - t) ** 1.6))
+        if alpha <= 0:
+            continue
+        sd.line([(pad, pad + y), (pad + cw, pad + y)],
+                fill=(255, 255, 255, alpha))
+    mask = Image.new("L", (width, height), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([pad, pad, pad + cw, pad + ch],
+                                           radius=radius, fill=255)
+    sheen.putalpha(ImageChops.multiply(sheen.split()[3], mask))
+    base = Image.alpha_composite(base.convert("RGBA"), sheen).convert("RGB")
+
+    # 1px 高光描边（在已合成的底色上绘制，RGB 已是混合结果）
+    edge = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    ImageDraw.Draw(edge).rounded_rectangle(
+        [pad, pad, pad + cw - 1, pad + ch - 1], radius=radius,
+        outline=palette["card_border"], width=1)
+    return Image.alpha_composite(base.convert("RGBA"), edge).convert("RGB")
+
+
+class GlassPanel(tk.Frame):
+    """液态玻璃面板：底层铺一张半透明圆角卡片，上层承载真实控件。
+
+    PhotoImage 必须保留在实例上，否则会被 GC 回收导致图片消失；
+    重绘走 Configure + 节流，避免拖拽窗口时连续渲染卡顿。
+    """
+
+    REDRAW_DELAY_MS = 130
+    MIN_SIZE = 12
+    def __init__(self, master, app, radius=20, padding=16, title=None,
+                 hint=None, surface="card", **kw):
+        tk.Frame.__init__(self, master, **kw)
+        self.app = app
+        self.radius = radius
+        self.pad_in = padding
+        # "window" = 直接压在环境光背景上；"card" = 压在另一张玻璃卡片上
+        self.surface_kind = surface
+        self._photo = None
+        self._pending = None
+        self._last_size = (0, 0)
+        # 先创建背景层，保证位于子控件之下。
+        # 必须给底色：尺寸不足或渲染失败时 redraw() 会早退，
+        # 此时若留 Tk 系统默认色，深色主题下会出现灰块。
+        self._bg = tk.Label(self, bd=0, highlightthickness=0,
+                            bg=app.card_bg())
+        self._bg.place(x=0, y=0, relwidth=1, relheight=1)
+        self.inner = tk.Frame(self)
+        self.inner.pack(fill=BOTH, expand=True, padx=padding, pady=padding)
+        # 标题与正文分区：标题固定 pack，正文容器独立，
+        # 避免同一个父容器里混用 pack 与 grid（Tk 不允许）
+        if title:
+            head = tk.Frame(self.inner)
+            head.pack(fill=X, pady=(0, 10))
+            ttk.Label(head, text=title, style="Section.TLabel").pack(anchor=W)
+            if hint:
+                ttk.Label(head, text=hint, style="Hint.TLabel").pack(anchor=W, pady=(3, 0))
+        self.body = tk.Frame(self.inner)
+        self.body.pack(fill=BOTH, expand=True)
+        self._sync_inner_bg()
+        self.bind("<Configure>", self._on_configure, add="+")
+        self.after_idle(self.redraw)
+
+    def _sync_inner_bg(self):
+        """内容容器用与卡片等效的实色，控件才不会"透出"卡片底图。"""
+        try:
+            bg = self.app.card_bg()
+            for w in (self.inner, self.body):
+                w.configure(bg=bg)
+            for child in self.inner.winfo_children():
+                if isinstance(child, tk.Frame) and child is not self.body:
+                    child.configure(bg=bg)
+        except Exception:
+            pass
+
+    def _on_configure(self, event=None):
+        size = (self.winfo_width(), self.winfo_height())
+        # 忽略小幅抖动，显著减少重绘次数
+        if (abs(size[0] - self._last_size[0]) < 8
+                and abs(size[1] - self._last_size[1]) < 8):
+            return
+        if self._pending is not None:
+            try:
+                self.after_cancel(self._pending)
+            except Exception:
+                pass
+        self._pending = self.after(self.REDRAW_DELAY_MS, self.redraw)
+
+    def redraw(self, force=False):
+        """立即重绘（切换主题时用 force 忽略尺寸去抖）"""
+        if self._pending is not None:
+            try:
+                self.after_cancel(self._pending)
+            except Exception:
+                pass
+            self._pending = None
+        if not self.app.glass_enabled():
+            try:
+                self._bg.configure(image="", bg=self.app.card_bg())
+            except Exception:
+                pass
+            return
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w < self.MIN_SIZE or h < self.MIN_SIZE:
+            return
+        self._last_size = (w, h)
+        try:
+            pal = self.app.palette()
+            base = (pal["surface"] if self.surface_kind == "window"
+                    else self.app.card_bg_rgb())
+            img = render_glass_card(w, h, pal, radius=self.radius,
+                                    surface=base)
+            self._photo = ImageTk.PhotoImage(img)
+            # 有 image 时 bg 不参与显示；传空串是非法颜色会抛 TclError
+            self._bg.configure(image=self._photo)
+        except Exception as exc:  # pragma: no cover - 渲染异常不应拖垮界面
+            _ui_warn("玻璃面板渲染失败: %s" % exc)
+
+    def refresh_theme(self):
+        self._sync_inner_bg()
+        self.redraw(force=True)
+
+
+# ============================================================
 # E. GUI Class - Initialization & Theme
 # ============================================================
 class PackagerApp:
@@ -875,8 +1247,15 @@ class PackagerApp:
         self.root = root
         self.root.title("%s v%s" % (APP_NAME, APP_VERSION))
         self.cfg = load_config()
-        w = self.cfg.get("window_width", 960)
-        h = self.cfg.get("window_height", 780)
+        w = self.cfg.get("window_width", 1180)
+        h = self.cfg.get("window_height", 900)
+        # 旧配置里存的是改造前的小尺寸（960x780），直接沿用会让
+        # 独立出来的"批量打包"页与折叠日志区显得拥挤，这里做下限钳制
+        try:
+            w = max(1060, int(w))
+            h = max(700, int(h))
+        except (TypeError, ValueError):
+            w, h = 1180, 900
         self.root.geometry("%dx%d" % (w, h))
         self.root.minsize(780, 580)
         self.source_var = StringVar(value=self.cfg.get("last_source", ""))
@@ -896,24 +1275,30 @@ class PackagerApp:
         self.current_project = self.cfg.get("last_project_file", "")
         self.current_theme = self.cfg.get("theme", "light")
         self._building = False
+        # 打包中关窗并被确认后置位：收尾回调据此跳过弹窗，
+        # 避免对已销毁的控件操作
+        self._closing = False
         # UI 更新队列：后台构建线程只能通过该队列投递回调，
         # 由主线程 after 轮询消费。Tkinter 非线程安全，
         # 直接跨线程调用 root.after 属未定义行为，长期运行有崩溃风险。
         self._ui_queue = queue.Queue()
-        # 记录初始配色，供浅色主题恢复使用（避免 configure(bg="") 抛错）
-        try:
-            self._init_root_bg = self.root.cget("background")
-        except Exception:
-            self._init_root_bg = None
+        # 液态玻璃：环境光背景铺满窗口，所有 GlassPanel 登记在此，
+        # 切换主题时统一重绘
+        self._glass_panels = []
+        self._backdrop_img = None
+        self._backdrop_size = None
+        self._backdrop = tk.Label(self.root, bd=0, highlightthickness=0,
+                                  bg=self.solid_bg())
+        self._backdrop.place(x=0, y=0, relwidth=1, relheight=1)
+        self._backdrop_after_id = None
+        self.root.bind("<Configure>", self._on_root_configure, add="+")
+        self.root.bind("<Map>", self._on_root_map, add="+")
+        if not GLASS_AVAILABLE and _PIL_IMPORT_ERROR:
+            _ui_warn("未启用液态玻璃效果（缺少 Pillow: %s），"
+                     "已回退为扁平主题" % _PIL_IMPORT_ERROR, "pil-missing")
         self._setup_styles()
         self._build_menu()
         self._build_ui()
-        # 记录日志区初始配色，供浅色主题恢复
-        try:
-            self._init_log_colors = (self.log_text.cget("background"),
-                                     self.log_text.cget("foreground"))
-        except Exception:
-            self._init_log_colors = None
         self._apply_theme(self.current_theme)
         self._check_tools()
         self._bind_shortcuts()
@@ -979,103 +1364,291 @@ class PackagerApp:
             if theme in available:
                 style.theme_use(theme)
                 break
-        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 14, "bold"))
-        style.configure("Status.TLabel", font=("Microsoft YaHei UI", 9))
-        style.configure("Build.TButton", font=("Microsoft YaHei UI", 10, "bold"))
-        style.configure("Treeview", font=("Consolas", 9))
-        style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 9, "bold"))
-        style.configure("Search.TLabel", font=("Microsoft YaHei UI", 9))
-        style.configure("History.Treeview", font=("Consolas", 9))
-        style.configure("History.Treeview.Heading", font=("Microsoft YaHei UI", 9, "bold"))
         self.style = style
+        self._font_ok = self._pick_fonts()
+        self._configure_modern_styles()
+
+    def _pick_fonts(self):
+        """挑一个系统里真实存在的字体族，缺失时回退默认。
+
+        直接假定 "Microsoft YaHei UI" 存在会在精简版 Windows 上
+        静默回退成难看的默认字体。
+        """
+        try:
+            import tkinter.font as tkfont
+            families = set(tkfont.families(self.root))
+        except Exception:
+            families = set()
+        for name in (UI_FONT, "Microsoft YaHei", "Segoe UI", "Tahoma", "Arial"):
+            if name in families:
+                self.ui_font = name
+                break
+        else:
+            self.ui_font = UI_FONT
+        for name in (UI_FONT_MONO, "Consolas", "Courier New"):
+            if name in families:
+                self.mono_font = name
+                break
+        else:
+            self.mono_font = UI_FONT_MONO
+        return self.ui_font
+
+    def _font(self, size=9, weight="normal"):
+        return (self.ui_font, size, weight)
+
+    def _mono(self, size=9):
+        return (self.mono_font, size)
+
+    def _configure_modern_styles(self):
+        """统一的现代扁平风格：去边框、大内边距、圆角观感。"""
+        p = self.palette()
+        f = self.ui_font
+        accent = p["accent"]
+        on_accent = p["on_accent"]
+        text = p["text"]
+        dim = p["text_dim"]
+        # 玻璃卡片内的控件底色 = 半透明填充与背景混合后的等效实色
+        card_bg = rgb_to_hex(self.card_bg_rgb())
+        accent2 = p["accent2"]
+        surface = p["surface"]
+        field_bg = rgb_to_hex(mix_rgb(surface, p["field"][:3], p["field"][3]))
+        hover = rgb_to_hex(mix_rgb(surface, p["hover"][:3], p["hover"][3]))
+        press = rgb_to_hex(mix_rgb(surface, p["press"][:3], p["press"][3]))
+        sel = p["sel"]
+
+        s = self.style
+        s.configure(".", font=(f, 9), background=card_bg, foreground=text,
+                    borderwidth=0, focuscolor=card_bg)
+        s.configure("TFrame", background=card_bg)
+        # Shell 层与玻璃卡片等效实色同色：嵌套 Frame 不会露出系统默认灰
+        s.configure("Shell.TFrame", background=card_bg)
+        s.configure("TLabel", background=card_bg, foreground=text,
+                    font=(f, 9))
+        s.configure("Title.TLabel", background=card_bg, foreground=text,
+                    font=(f, 17, "bold"))
+        s.configure("Subtitle.TLabel", background=card_bg, foreground=dim,
+                    font=(f, 9))
+        s.configure("Section.TLabel", background=card_bg, foreground=text,
+                    font=(f, 10, "bold"))
+        s.configure("Status.TLabel", background=card_bg, foreground=dim,
+                    font=(f, 9))
+        s.configure("Hint.TLabel", background=card_bg, foreground=dim,
+                    font=(f, 8))
+        s.configure("Danger.TLabel", background=card_bg, foreground="#ff6b6b",
+                    font=(f, 9))
+        s.configure("OK.TLabel", background=card_bg, foreground="#2ecc71",
+                    font=(f, 9))
+        # 链接色用强调色：硬编码 "blue" 在深色主题下对比度不足
+        s.configure("Link.TLabel", background=card_bg, foreground=accent,
+                    font=(f, 9))
+
+        # 主按钮：强调色实底 + 大内边距，形成明确的主 CTA
+        s.configure("TButton", background=field_bg, foreground=text,
+                    borderwidth=0, focusthickness=0, padding=(12, 7),
+                    font=(f, 9), relief="flat", anchor="center")
+        s.map("TButton",
+              background=[("disabled", press), ("pressed", press), ("active", hover)],
+              foreground=[("disabled", dim)])
+        s.configure("Build.TButton", background=accent, foreground=on_accent,
+                    font=(f, 11, "bold"), padding=(20, 11), relief="flat",
+                    borderwidth=0, focusthickness=0)
+        s.map("Build.TButton",
+              background=[("disabled", press), ("pressed", accent2), ("active", accent2)],
+              foreground=[("disabled", dim)])
+
+        s.configure("Ghost.TButton", background=card_bg, foreground=accent,
+                    font=(f, 9, "bold"), padding=(10, 5), relief="flat",
+                    borderwidth=0, focusthickness=0)
+        s.map("Ghost.TButton",
+              background=[("pressed", press), ("active", hover)])
+
+        s.configure("TEntry", fieldbackground=field_bg, foreground=text,
+                    borderwidth=0, relief="flat", padding=(10, 6),
+                    insertcolor=text, lightcolor=field_bg, darkcolor=field_bg)
+        s.map("TEntry", lightcolor=[("focus", accent)],
+              darkcolor=[("focus", accent)],
+              bordercolor=[("focus", accent)])
+        s.configure("TCombobox", fieldbackground=field_bg, background=field_bg,
+                    foreground=text, borderwidth=0, relief="flat",
+                    padding=(9, 7), arrowcolor=dim,
+                    lightcolor=field_bg, darkcolor=field_bg)
+        s.map("TCombobox", fieldbackground=[("readonly", field_bg)],
+              foreground=[("readonly", text)])
+        s.configure("TScrollbar", background=hover, troughcolor=card_bg,
+                    bordercolor=card_bg, arrowcolor=dim, borderwidth=0)
+        s.configure("TProgressbar", background=accent, troughcolor=field_bg,
+                    bordercolor=field_bg, lightcolor=accent, darkcolor=accent,
+                    borderwidth=0, thickness=8)
+        s.configure("TCheckbutton", background=card_bg, foreground=text,
+                    font=(f, 9), focuscolor=card_bg)
+        s.map("TCheckbutton", background=[("active", card_bg)])
+        s.configure("TRadiobutton", background=card_bg, foreground=text,
+                    font=(f, 9), focuscolor=card_bg)
+        s.map("TRadiobutton", background=[("active", card_bg)])
+
+        # Notebook：页签做成胶囊状，选中态用强调色
+        s.configure("TNotebook", background=card_bg, borderwidth=0, tabmargins=(2, 6, 2, 0))
+        s.configure("TNotebook.Tab", background=field_bg, foreground=dim,
+                    padding=(16, 9), borderwidth=0, font=(f, 9))
+        s.map("TNotebook.Tab",
+              background=[("selected", accent), ("active", hover)],
+              foreground=[("selected", on_accent), ("active", text)])
+
+        # 表格：透明行、柔和表头。light/dark/border 三色都要压到卡片底色，
+        # 否则 clam 主题的默认边框会在深色下形成刺眼白框。
+        s.configure("Treeview", background=card_bg, fieldbackground=card_bg,
+                    foreground=text, borderwidth=0, relief="flat",
+                    rowheight=26, lightcolor=card_bg, darkcolor=card_bg,
+                    bordercolor=card_bg, font=(self.mono_font, 9))
+        s.map("Treeview", background=[("selected", sel)],
+              foreground=[("selected", "#ffffff")],
+              lightcolor=[("selected", sel)], darkcolor=[("selected", sel)],
+              bordercolor=[("selected", sel)])
+        s.configure("Treeview.Heading", background=field_bg, foreground=dim,
+                    font=(f, 9, "bold"), relief="flat", borderwidth=0,
+                    padding=(8, 7))
+        s.map("Treeview.Heading", background=[("active", hover)])
+        s.map("Treeview", background=[("selected", sel)],
+              foreground=[("selected", "#ffffff")])
+        s.configure("History.Treeview", background=card_bg,
+                    fieldbackground=card_bg, foreground=text, rowheight=26)
+        s.configure("History.Treeview.Heading", background=field_bg,
+                    foreground=dim, font=(f, 9, "bold"), relief="flat")
+
+    # --- Liquid Glass helpers ---
+    def _on_root_configure(self, event=None):
+        """窗口尺寸变化时重建环境光背景（节流，避免拖拽时连续渲染）。"""
+        if event is not None and getattr(event, "widget", None) is not self.root:
+            return
+        if self._backdrop_after_id is not None:
+            try:
+                self.root.after_cancel(self._backdrop_after_id)
+            except Exception:
+                pass
+        self._backdrop_after_id = self.root.after(180, self._redraw_backdrop)
+
+    def _on_root_map(self, event=None):
+        """窗口首次显示 / 从最小化恢复：此时才有真实尺寸。
+
+        复用 after 节流而非同步渲染，否则任务栏反复点击会连续触发
+        全窗口 PIL 渲染造成明显卡顿。
+        """
+        if event is not None and getattr(event, "widget", None) is not self.root:
+            return
+        size = (self.root.winfo_width(), self.root.winfo_height())
+        if size == getattr(self, "_backdrop_size", None) and self._backdrop_img is not None:
+            return
+        if self._backdrop_after_id is not None:
+            try:
+                self.root.after_cancel(self._backdrop_after_id)
+            except Exception:
+                pass
+        self._backdrop_after_id = self.root.after(120, self._redraw_backdrop)
+
+    def _redraw_backdrop(self):
+        self._backdrop_after_id = None
+        self._backdrop_size = (self.root.winfo_width(), self.root.winfo_height())
+        self._refresh_window_backdrop()
+
+    def register_glass(self, panel):
+        self._glass_panels.append(panel)
+        return panel
+
+    def palette(self):
+        """当前主题调色板（GLASS_PALETTES 的一项）"""
+        return GLASS_PALETTES.get(getattr(self, "current_theme", "light"),
+                                  GLASS_PALETTES["light"])
+
+    def glass_enabled(self):
+        return GLASS_AVAILABLE and not getattr(self, "_glass_off", False)
+
+    def solid_bg(self):
+        """无玻璃效果时使用的实色背景（降级路径）"""
+        return rgb_to_hex(self.palette()["bg_bottom"])
+
+    def card_bg_rgb(self):
+        """卡片填充与 surface 混合后的实际颜色（RGB 元组）。"""
+        p = self.palette()
+        return mix_rgb(p["surface"], p["card_fill"][:3], p["card_fill"][3])
+
+    def card_bg(self):
+        """玻璃卡片内控件应使用的等效实色背景。"""
+        return rgb_to_hex(self.card_bg_rgb())
 
 
     # --- Theme Management ---
-    DARK_THEME = {
-        "bg": "#2b2b2b",
-        "fg": "#e0e0e0",
-        "entry_bg": "#3c3f41",
-        "entry_fg": "#e0e0e0",
-        "btn_bg": "#4a4d4e",
-        "btn_fg": "#e0e0e0",
-        "tree_bg": "#2b2b2b",
-        "tree_fg": "#e0e0e0",
-        "select_bg": "#4b6eaf",
-        "log_bg": "#1e1e1e",
-        "log_fg": "#d4d4d4",
-    }
-
-    LIGHT_THEME = {
-        "bg": None,
-        "fg": None,
-        "entry_bg": None,
-        "entry_fg": None,
-        "btn_bg": None,
-        "btn_fg": None,
-        "tree_bg": None,
-        "tree_fg": None,
-        "select_bg": None,
-        "log_bg": None,
-        "log_fg": None,
-    }
-
     def _apply_theme(self, theme_name):
+        """应用主题：重设 ttk 样式、窗口背景、日志区，并刷新所有玻璃面板。"""
+        if theme_name not in GLASS_PALETTES:
+            theme_name = "light"
         self.current_theme = theme_name
-        theme = self.DARK_THEME if theme_name == "dark" else self.LIGHT_THEME
-        root = self.root
-        if theme_name == "dark":
-            root.configure(bg=theme["bg"])
-            self.style.configure(".", background=theme["bg"], foreground=theme["fg"])
-            self.style.configure("TFrame", background=theme["bg"])
-            self.style.configure("TLabel", background=theme["bg"], foreground=theme["fg"])
-            self.style.configure("Title.TLabel", background=theme["bg"], foreground=theme["fg"])
-            self.style.configure("Status.TLabel", background=theme["bg"], foreground=theme["fg"])
-            self.style.configure("TButton", background=theme["btn_bg"], foreground=theme["btn_fg"])
-            self.style.configure("Build.TButton", background=theme["btn_bg"], foreground=theme["btn_fg"])
-            self.style.configure("TCheckbutton", background=theme["bg"], foreground=theme["fg"])
-            self.style.configure("TRadiobutton", background=theme["bg"], foreground=theme["fg"])
-            self.style.configure("Treeview", background=theme["tree_bg"], foreground=theme["tree_fg"],
-                                 fieldbackground=theme["tree_bg"])
-            self.style.configure("Treeview.Heading", background=theme["btn_bg"], foreground=theme["btn_fg"])
-            self.style.map("Treeview", background=[("selected", theme["select_bg"])],
-                           foreground=[("selected", "#ffffff")])
-            self.style.configure("TLabelframe", background=theme["bg"], foreground=theme["fg"])
-            self.style.configure("TLabelframe.Label", background=theme["bg"], foreground=theme["fg"])
-            self.style.configure("TNotebook", background=theme["bg"])
-            self.style.configure("TNotebook.Tab", background=theme["btn_bg"], foreground=theme["btn_fg"])
-            self.style.map("TNotebook.Tab",
-                           background=[("selected", theme["select_bg"])],
-                           foreground=[("selected", "#ffffff")])
-            self.style.configure("Horizontal.TProgressbar", background=theme["select_bg"],
-                                 troughcolor=theme["entry_bg"])
+        p = self.palette()
+
+        # 窗口底色：玻璃模式下会被背景图覆盖，这里只保证降级路径有正确底色
+        self.root.configure(bg=self.solid_bg())
+        self._refresh_window_backdrop()
+        self._configure_modern_styles()
+
+        # 工具状态标签用状态色
+        for attr, ok_style, bad_style in (
+                ("inno_label", "OK.TLabel", "Danger.TLabel"),
+                ("zip7_label", "OK.TLabel", "Danger.TLabel"),
+                ("nsis_label", "OK.TLabel", "Danger.TLabel")):
+            widget = getattr(self, attr, None)
+            if widget is None:
+                continue
             try:
-                self.log_text.configure(bg=theme["log_bg"], fg=theme["log_fg"],
-                                        insertbackground=theme["log_fg"])
+                text = str(widget.cget("text"))
+                widget.configure(style=ok_style if "未安装" not in text
+                                 else bad_style)
             except Exception:
                 pass
-        else:
-            # 重置到初始主题（系统默认）
-            available = self.style.theme_names()
-            for tname in ("clam", "vista", "winnative", "default"):
-                if tname in available:
-                    self.style.theme_use(tname)
-                    break
-            # 恢复根窗口底色：空串不是合法颜色值会抛 TclError，
-            # 必须与 log_text 恢复拆开，否则前者抛错会连带跳过后者
-            if getattr(self, "_init_root_bg", None):
-                try:
-                    self.root.configure(bg=self._init_root_bg)
-                except Exception:
-                    pass
-            if getattr(self, "_init_log_colors", None):
-                bg, fg = self._init_log_colors
-            else:
-                bg, fg = "SystemWindow", "SystemText"
+
+        # Tk 的颜色必须写成 #rrggbb，元组会被当成颜色名而报
+        # "unknown color name '7 11 24'"
+        try:
+            self.log_text.configure(bg=rgb_to_hex(p["log"]), fg=p["text"],
+                                    insertbackground=p["text"],
+                                    highlightthickness=0, borderwidth=0)
+        except Exception as exc:
+            _ui_warn("日志区配色失败: %s" % exc)
+
+        # 原生 Listbox 不吃 ttk 样式，须单独配色
+        try:
+            field = rgb_to_hex(mix_rgb(p["surface"], p["field"][:3], p["field"][3]))
+            self.batch_listbox.configure(bg=field, fg=p["text"],
+                                         selectbackground=p["sel"],
+                                         selectforeground="#ffffff",
+                                         highlightthickness=0, borderwidth=0)
+        except Exception as exc:
+            _ui_warn("批量列表配色失败: %s" % exc)
+
+        for panel in getattr(self, "_glass_panels", []):
             try:
-                self.log_text.configure(bg=bg, fg=fg, insertbackground="black")
+                panel.refresh_theme()
             except Exception:
                 pass
         self.cfg["theme"] = theme_name
+
+    def _refresh_window_backdrop(self):
+        """重建铺满窗口的环境光背景图。"""
+        if not self.glass_enabled():
+            try:
+                if self._backdrop is not None:
+                    self._backdrop.configure(image="")
+            except Exception:
+                pass
+            return
+        w = self.root.winfo_width()
+        h = self.root.winfo_height()
+        if w < 40 or h < 40:
+            return
+        try:
+            img = render_aurora_background(w, h, self.palette())
+            self._backdrop_img = ImageTk.PhotoImage(img)
+            self._backdrop.configure(image=self._backdrop_img)
+        except Exception as exc:  # pragma: no cover
+            _ui_warn("窗口背景渲染失败: %s" % exc)
 
 
     # --- Menu Bar ---
@@ -1175,109 +1748,230 @@ class PackagerApp:
 
     # --- Build UI ---
     def _build_ui(self):
-        main_frame = Frame(self.root)
-        main_frame.pack(fill=BOTH, expand=True, padx=8, pady=4)
+        # 整窗作为一张大玻璃卡片：留出较宽的边距让环境光背景透进来，
+        # 这是"玻璃"观感的来源；内部再嵌套卡片，形成多层次半透明质感。
+        shell = self.register_glass(
+            GlassPanel(self.root, self, radius=30, padding=13,
+                       surface="window"))
+        shell.pack(fill=BOTH, expand=True, padx=16, pady=(14, 16))
+        body = shell.inner
 
-        title_label = ttk.Label(main_frame, text=APP_NAME, style="Title.TLabel")
-        title_label.pack(side=TOP, pady=(0, 6))
+        self._build_header(body)
 
-        notebook = ttk.Notebook(main_frame)
-        notebook.pack(fill=BOTH, expand=True, pady=(0, 4))
+        # 主内容卡片
+        content_panel = self.register_glass(
+            GlassPanel(body, self, radius=20, padding=8))
+        content_panel.pack(fill=BOTH, expand=True, pady=(0, 12))
+        content = content_panel.inner
+
+        notebook = ttk.Notebook(content)
+        notebook.pack(fill=BOTH, expand=True)
         self.notebook = notebook
 
         self._build_tab_basic(notebook)
+        self._build_tab_batch(notebook)
         self._build_tab_files(notebook)
         self._build_tab_stats(notebook)
         self._build_tab_advanced(notebook)
         self._build_tab_history(notebook)
 
-        self._build_bottom(main_frame)
+        self._build_bottom(body)
         self._init_log_tags()
 
+    def _build_header(self, parent):
+        """标题区：大标题 + 版本副标题，右侧放主题切换等入口。"""
+        header = ttk.Frame(parent)
+        header.pack(fill=X, pady=(2, 14))
+        header.configure(style="Shell.TFrame")
+
+        left = ttk.Frame(header)
+        left.pack(side=LEFT, fill=X, expand=True)
+        left.configure(style="Shell.TFrame")
+
+        ttk.Label(left, text=APP_NAME, style="Title.TLabel").pack(anchor=W)
+        ttk.Label(left, text="v%s · 一键生成 Windows 安装包" % APP_VERSION,
+                  style="Subtitle.TLabel").pack(anchor=W, pady=(3, 0))
+
+        right = ttk.Frame(header)
+        right.pack(side=RIGHT)
+        right.configure(style="Shell.TFrame")
+        ttk.Button(right, text="切换主题", style="Ghost.TButton",
+                   command=self._toggle_theme).pack(side=RIGHT)
+        # 外部工具状态常驻标题栏：原先放在"高级选项"页里，那个 tab 因此
+        # 请求高度达 735px，会把 notebook 撑大并把底部操作区挤出窗口
+        self._tools_summary_var = StringVar(value="")
+        tools_lbl = ttk.Label(right, textvariable=self._tools_summary_var,
+                              style="Hint.TLabel")
+        tools_lbl.pack(side=RIGHT, padx=(0, 16))
+        self._tools_detail = StringVar(value="")
+        try:
+            # tkinter.Tooltip 在 3.13 才有，且位于子模块，
+            # `from tkinter import Tooltip` 会直接 ImportError
+            from tkinter.tooltip import Tooltip
+            Tooltip(tools_lbl, self._tools_detail)
+        except Exception:
+            pass  # 低版本无内置 Tooltip，静默降级
+        # 隐藏的标签对象：状态文本 + 颜色由 _check_tools 统一维护
+        # （放在 header 里但不可见，供 tooltip 与测试读取）
+        self._tool_labels = {}
+        for key, name in (("inno_label", "Inno Setup"),
+                          ("zip7_label", "7-Zip"),
+                          ("nsis_label", "NSIS")):
+            lbl = ttk.Label(right, text=name)
+            lbl.place(x=0, y=0, width=1, height=1)
+            self._tool_labels[key] = lbl
+            setattr(self, key, lbl)
+        self.header_actions = right
+
     def _build_tab_basic(self, notebook):
-        tab_basic = ttk.Frame(notebook, padding=10)
+        tab_basic = ttk.Frame(notebook, padding=(18, 16))
         notebook.add(tab_basic, text=" 基本设置 ")
+        tab_basic.columnconfigure(0, weight=1)
+        # 让卡片撑满内容区：否则下方会留一大片"空容器"显得未完成。
+        # rowconfigure 只影响多余空间的分配，不会增加请求高度。
+        tab_basic.rowconfigure(0, weight=1)
+
+        # 分组卡片：基本信息
+        info = self.register_glass(GlassPanel(tab_basic, self, radius=16,
+                                               padding=14, title="基本信息"))
+        info.grid(row=0, column=0, columnspan=3, sticky="nsew", pady=(0, 12))
+        f = info.body
 
         row = 0
-        ttk.Label(tab_basic, text="源文件夹:").grid(row=row, column=0, sticky=W, pady=4)
-        src_entry = ttk.Entry(tab_basic, textvariable=self.source_var, width=60)
-        src_entry.grid(row=row, column=1, sticky=W+E, padx=(4, 4), pady=4)
+        ttk.Label(f, text="源文件夹").grid(row=row, column=0, sticky=W, pady=5)
+        src_entry = ttk.Entry(f, textvariable=self.source_var)
+        src_entry.grid(row=row, column=1, sticky="ew", padx=(14, 10), pady=6)
         self.src_entry = src_entry
-        ttk.Button(tab_basic, text="浏览...", command=self._browse_source).grid(row=row, column=2, pady=4)
-        tab_basic.columnconfigure(1, weight=1)
+        ttk.Button(f, text="浏览", command=self._browse_source).grid(row=row, column=2, pady=6)
+        f.columnconfigure(1, weight=1)
 
         row += 1
-        ttk.Label(tab_basic, text="输出目录:").grid(row=row, column=0, sticky=W, pady=4)
-        ttk.Entry(tab_basic, textvariable=self.output_var, width=60).grid(row=row, column=1, sticky=W+E, padx=(4, 4), pady=4)
-        ttk.Button(tab_basic, text="浏览...", command=self._browse_output).grid(row=row, column=2, pady=4)
+        ttk.Label(f, text="输出目录").grid(row=row, column=0, sticky=W, pady=5)
+        ttk.Entry(f, textvariable=self.output_var).grid(row=row, column=1, sticky="ew", padx=(14, 10), pady=6)
+        ttk.Button(f, text="浏览", command=self._browse_output).grid(row=row, column=2, pady=6)
 
         row += 1
-        ttk.Label(tab_basic, text="应用名称:").grid(row=row, column=0, sticky=W, pady=4)
-        ttk.Entry(tab_basic, textvariable=self.appname_var, width=40).grid(row=row, column=1, sticky=W, padx=(4, 4), pady=4)
+        ttk.Label(f, text="应用名称").grid(row=row, column=0, sticky=W, pady=5)
+        ttk.Entry(f, textvariable=self.appname_var).grid(row=row, column=1, sticky="ew", padx=(14, 10), pady=6)
 
         row += 1
-        ttk.Label(tab_basic, text="版本号:").grid(row=row, column=0, sticky=W, pady=4)
-        ttk.Entry(tab_basic, textvariable=self.appver_var, width=20).grid(row=row, column=1, sticky=W, padx=(4, 4), pady=4)
+        ttk.Label(f, text="版本号").grid(row=row, column=0, sticky=W, pady=5)
+        ttk.Entry(f, textvariable=self.appver_var, width=16).grid(row=row, column=1, sticky=W, padx=(14, 10), pady=6)
 
         row += 1
-        ttk.Label(tab_basic, text="发布者:").grid(row=row, column=0, sticky=W, pady=4)
-        ttk.Entry(tab_basic, textvariable=self.publisher_var, width=40).grid(row=row, column=1, sticky=W, padx=(4, 4), pady=4)
+        ttk.Label(f, text="发布者").grid(row=row, column=0, sticky=W, pady=5)
+        ttk.Entry(f, textvariable=self.publisher_var).grid(row=row, column=1, sticky="ew", padx=(14, 10), pady=6)
 
-        row += 1
-        batch_frame = ttk.LabelFrame(tab_basic, text="批量打包 - 待打包文件夹列表", padding=6)
-        batch_frame.grid(row=row, column=0, columnspan=3, sticky=W+E, pady=(8, 0))
-        tab_basic.rowconfigure(row, weight=1)
+        # 仅在 Ctrl+V 且用户明确触发时粘贴（避免 FocusIn 自动覆盖）
+        src_entry.bind("<Control-v>", lambda e: self._paste_path_to_source())
 
-        batch_list_frame = Frame(batch_frame)
+        # 批量打包独立成 tab：与基本信息同页时 tab 请求高度过大，
+        # 会把底部的操作区与日志区整个挤出窗口。
+        self._batch_hint_var = StringVar(value="")
+        tip = ttk.Label(tab_basic, textvariable=self._batch_hint_var,
+                        style="Hint.TLabel")
+        tip.grid(row=1, column=0, columnspan=3, sticky=W, pady=(0, 0))
+        self._batch_tab_tip = tip
+
+    def _batch_count_text(self):
+        try:
+            n = int(self.batch_listbox.size())
+        except Exception:
+            return ""
+        if n <= 0:
+            return ("批量列表为空。切换到「批量打包」页添加多个源目录，"
+                    "之后直接点「开始打包」即可逐个生成产物。")
+        return "批量列表共 %d 个文件夹，开始打包后将逐个输出到带序号的子目录。" % n
+
+    def _build_tab_batch(self, notebook):
+        tab_batch = ttk.Frame(notebook, padding=(18, 16))
+        notebook.add(tab_batch, text=" 批量打包 ")
+        tab_batch.columnconfigure(0, weight=1)
+        tab_batch.rowconfigure(0, weight=1)
+
+        card = self.register_glass(
+            GlassPanel(tab_batch, self, radius=16, padding=16, title="待打包文件夹",
+                       hint="一次打包多个文件夹，各自输出到带序号的子目录"))
+        card.grid(row=0, column=0, sticky="nsew")
+        batch_frame = card.body
+
+        batch_list_frame = ttk.Frame(batch_frame)
         batch_list_frame.pack(fill=BOTH, expand=True)
+        batch_list_frame.configure(style="Shell.TFrame")
 
-        self.batch_listbox = Listbox(batch_list_frame, height=4, font=("Consolas", 9), selectmode="extended")
+        self.batch_listbox = Listbox(batch_list_frame, height=8, font=self._mono(9),
+                                     selectmode="extended", bd=0,
+                                     highlightthickness=0, activestyle="none")
         batch_scroll = ttk.Scrollbar(batch_list_frame, orient="vertical", command=self.batch_listbox.yview)
         self.batch_listbox.configure(yscrollcommand=batch_scroll.set)
         self.batch_listbox.pack(side=LEFT, fill=BOTH, expand=True)
         batch_scroll.pack(side=RIGHT, fill=Y)
+        # 列表变化时同步「基本设置」页的提示文案
+        self.batch_listbox.bind("<<ListboxSelect>>", self._on_batch_list_change)
+        self.batch_listbox.bind("<ButtonRelease-1>", self._on_batch_list_change)
 
-        batch_btn_frame = Frame(batch_frame)
-        batch_btn_frame.pack(fill=X, pady=(4, 0))
-        ttk.Button(batch_btn_frame, text="添加文件夹", command=self._add_batch_folder).pack(side=LEFT, padx=(0, 4))
-        ttk.Button(batch_btn_frame, text="移除选中", command=self._remove_batch_folder).pack(side=LEFT, padx=(0, 4))
-        ttk.Button(batch_btn_frame, text="清空列表", command=self._clear_batch_folders).pack(side=LEFT, padx=(0, 4))
-        ttk.Button(batch_btn_frame, text="从剪贴板粘贴路径", command=self._paste_path_to_source).pack(side=LEFT, padx=(0, 4))
-        ttk.Label(batch_btn_frame, text="提示: Ctrl+V 粘贴路径到源文件夹", foreground="gray").pack(side=LEFT, padx=(8, 0))
-
-        # 仅在 Ctrl+V 且用户明确触发时粘贴（避免 FocusIn 自动覆盖）
-        src_entry.bind("<Control-v>", lambda e: self._paste_path_to_source())
+        batch_btn_frame = ttk.Frame(batch_frame)
+        batch_btn_frame.pack(fill=X, pady=(12, 0))
+        batch_btn_frame.configure(style="Shell.TFrame")
+        ttk.Button(batch_btn_frame, text="添加文件夹", command=self._add_batch_folder).pack(side=LEFT, padx=(0, 8))
+        ttk.Button(batch_btn_frame, text="移除选中", command=self._remove_batch_folder).pack(side=LEFT, padx=(0, 8))
+        ttk.Button(batch_btn_frame, text="清空列表", command=self._clear_batch_folders).pack(side=LEFT, padx=(0, 8))
+        ttk.Button(batch_btn_frame, text="从剪贴板粘贴", command=self._paste_path_to_source).pack(side=LEFT, padx=(0, 8))
+        ttk.Label(batch_btn_frame, text="Ctrl+V 可直接粘贴路径", style="Hint.TLabel").pack(side=LEFT, padx=(8, 0))
 
         # 启动时恢复上次的批量列表
         for _src in self.cfg.get("batch_sources", []):
             if _src:
                 self.batch_listbox.insert(END, _src)
+        self._refresh_batch_hint()
+
+    def _on_batch_list_change(self, event=None):
+        self._refresh_batch_hint()
+
+    def _refresh_batch_hint(self):
+        var = getattr(self, "_batch_hint_var", None)
+        if var is None:
+            return
+        try:
+            var.set(self._batch_count_text())
+        except Exception:
+            pass
+
 
     def _build_tab_files(self, notebook):
-        tab_files = ttk.Frame(notebook, padding=10)
+        tab_files = ttk.Frame(notebook, padding=(18, 16))
         notebook.add(tab_files, text=" 文件预览 ")
+        tab_files.columnconfigure(0, weight=1)
+        tab_files.rowconfigure(0, weight=1)
 
-        search_frame = Frame(tab_files)
-        search_frame.pack(fill=X, pady=(0, 4))
-        ttk.Label(search_frame, text="搜索:", style="Search.TLabel").pack(side=LEFT, padx=(0, 4))
-        search_entry = ttk.Entry(search_frame, textvariable=self.search_var, width=30)
-        search_entry.pack(side=LEFT, padx=(0, 8))
+        card = self.register_glass(GlassPanel(tab_files, self, radius=16, padding=16))
+        card.pack(fill=BOTH, expand=True)
+        body = card.inner
+
+        search_frame = ttk.Frame(body)
+        search_frame.pack(fill=X, pady=(0, 12))
+        search_frame.configure(style="Shell.TFrame")
+        ttk.Label(search_frame, text="搜索").pack(side=LEFT, padx=(0, 10))
+        search_entry = ttk.Entry(search_frame, textvariable=self.search_var, width=32)
+        search_entry.pack(side=LEFT, padx=(0, 12))
         self._search_after_id = None
         search_entry.bind("<KeyRelease>", self._on_search_key)
         ttk.Checkbutton(search_frame, text="区分大小写", variable=self.case_sensitive_var,
-                        command=self._filter_file_tree).pack(side=LEFT, padx=(0, 8))
-        ttk.Button(search_frame, text="刷新 (F5)", command=self._refresh_file_tree).pack(side=LEFT, padx=(0, 4))
-        ttk.Button(search_frame, text="导出CSV", command=self._export_file_list_csv).pack(side=LEFT)
+                        command=self._filter_file_tree).pack(side=LEFT, padx=(0, 12))
+        ttk.Button(search_frame, text="刷新", command=self._refresh_file_tree).pack(side=RIGHT, padx=(8, 0))
+        ttk.Button(search_frame, text="导出 CSV", command=self._export_file_list_csv).pack(side=RIGHT)
 
-        tree_frame = Frame(tab_files)
+        tree_frame = ttk.Frame(body)
         tree_frame.pack(fill=BOTH, expand=True)
+        tree_frame.configure(style="Shell.TFrame")
 
         columns = ("name", "size")
-        self.file_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
+        self.file_tree = ttk.Treeview(tree_frame, columns=columns, show="headings",
+                                      selectmode="browse")
         self.file_tree.heading("name", text="文件路径")
         self.file_tree.heading("size", text="大小")
         self.file_tree.column("name", width=500, minwidth=200)
-        self.file_tree.column("size", width=100, minwidth=60, anchor=E)
+        self.file_tree.column("size", width=110, minwidth=70, anchor=E)
 
         tree_scroll_y = ttk.Scrollbar(tree_frame, orient="vertical", command=self.file_tree.yview)
         tree_scroll_x = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.file_tree.xview)
@@ -1286,162 +1980,225 @@ class PackagerApp:
         self.file_tree.bind("<Button-3>", self._on_file_tree_right_click)
         self.file_tree.bind("<Double-1>", self._on_file_tree_double_click)
 
-        self.file_tree.grid(row=0, column=0, sticky=N+S+E+W)
-        tree_scroll_y.grid(row=0, column=1, sticky=N+S)
-        tree_scroll_x.grid(row=1, column=0, sticky=E+W)
+        self.file_tree.grid(row=0, column=0, sticky="nsew")
+        tree_scroll_y.grid(row=0, column=1, sticky="ns")
+        tree_scroll_x.grid(row=1, column=0, sticky="ew")
         tree_frame.rowconfigure(0, weight=1)
         tree_frame.columnconfigure(0, weight=1)
 
-        stats_frame = Frame(tab_files)
-        stats_frame.pack(fill=X, pady=(4, 0))
-        self.file_count_label = ttk.Label(stats_frame, text="文件数: 0", style="Status.TLabel")
-        self.file_count_label.pack(side=LEFT, padx=(0, 20))
-        self.file_size_label = ttk.Label(stats_frame, text="总大小: 0 B", style="Status.TLabel")
-        self.file_size_label.pack(side=LEFT)
+        stats_frame = ttk.Frame(body)
+        stats_frame.pack(fill=X, pady=(12, 0))
+        stats_frame.configure(style="Shell.TFrame")
+        self.file_count_label = ttk.Label(stats_frame, text="文件数  0", style="Status.TLabel")
+        self.file_count_label.pack(side=LEFT)
+        self.file_size_label = ttk.Label(stats_frame, text="总大小  0 B", style="Status.TLabel")
+        self.file_size_label.pack(side=RIGHT)
 
 
     def _build_tab_advanced(self, notebook):
-        tab_adv = ttk.Frame(notebook, padding=10)
+        tab_adv = ttk.Frame(notebook, padding=(18, 16))
         notebook.add(tab_adv, text=" 高级选项 ")
+        tab_adv.columnconfigure(0, weight=1)
+        tab_adv.rowconfigure(0, weight=1)
+
+        # 分组卡片：打包选项
+        opt_card = self.register_glass(GlassPanel(tab_adv, self, radius=16,
+                                                  padding=13, title="打包选项"))
+        opt_card.grid(row=0, column=0, columnspan=3, sticky="nsew", pady=(0, 12))
+        f = opt_card.body
 
         row = 0
-        ttk.Label(tab_adv, text="打包模式:").grid(row=row, column=0, sticky=W, pady=6)
-        mode_frame = Frame(tab_adv)
-        mode_frame.grid(row=row, column=1, sticky=W, padx=(4, 0), pady=6)
-        ttk.Radiobutton(mode_frame, text="Inno Setup (安装包)", variable=self.mode_var, value="inno").pack(side=LEFT, padx=(0, 12))
-        ttk.Radiobutton(mode_frame, text="7-Zip SFX (自解压)", variable=self.mode_var, value="7zip").pack(side=LEFT, padx=(0, 12))
-        ttk.Radiobutton(mode_frame, text="ZIP (简易打包)", variable=self.mode_var, value="zip").pack(side=LEFT, padx=(0, 12))
-        ttk.Radiobutton(mode_frame, text="NSIS (安装包)", variable=self.mode_var, value="nsis").pack(side=LEFT)
+        ttk.Label(f, text="打包模式").grid(row=row, column=0, sticky=W, pady=7)
+        mode_frame = ttk.Frame(f)
+        mode_frame.grid(row=row, column=1, sticky=W, padx=(14, 0), pady=7)
+        mode_frame.configure(style="Shell.TFrame")
+        ttk.Radiobutton(mode_frame, text="Inno Setup", variable=self.mode_var, value="inno").pack(side=LEFT, padx=(0, 16))
+        ttk.Radiobutton(mode_frame, text="NSIS", variable=self.mode_var, value="nsis").pack(side=LEFT, padx=(0, 16))
+        ttk.Radiobutton(mode_frame, text="7-Zip SFX", variable=self.mode_var, value="7zip").pack(side=LEFT, padx=(0, 16))
+        ttk.Radiobutton(mode_frame, text="ZIP", variable=self.mode_var, value="zip").pack(side=LEFT)
 
         row += 1
-        ttk.Label(tab_adv, text="压缩级别:").grid(row=row, column=0, sticky=W, pady=6)
+        ttk.Label(f, text="压缩级别").grid(row=row, column=0, sticky=W, pady=7)
         self.compression_var = StringVar(value=self.cfg.get("compression_level", "9"))
-        comp_combo = ttk.Combobox(tab_adv, textvariable=self.compression_var, width=20, state="readonly",
+        comp_combo = ttk.Combobox(f, textvariable=self.compression_var, width=14, state="readonly",
                                    values=["0", "1", "3", "5", "7", "9"])
-        comp_combo.grid(row=row, column=1, sticky=W, padx=(4, 0), pady=6)
-        comp_labels = {"0": "存储(0)", "1": "最快(1)", "3": "快速(3)", "5": "标准(5)", "7": "最大(7)", "9": "极限(9)"}
-        self.comp_hint_label = ttk.Label(tab_adv, text=comp_labels.get(self.compression_var.get(), "极限(9)"),
-                                         foreground="gray")
-        self.comp_hint_label.grid(row=row, column=2, sticky=W, padx=(8, 0), pady=6)
+        comp_combo.grid(row=row, column=1, sticky=W, padx=(14, 10), pady=7)
+        comp_labels = {"0": "存储 · 最快", "1": "最快", "3": "快速",
+                       "5": "标准", "7": "最大", "9": "极限 · 最小体积"}
+        self.comp_hint_label = ttk.Label(f, text=comp_labels.get(self.compression_var.get(), ""),
+                                         style="Hint.TLabel")
+        self.comp_hint_label.grid(row=row, column=2, sticky=W, padx=(0, 0), pady=7)
+
         def _update_comp_label(event=None):
             val = self.compression_var.get()
             self.comp_hint_label.config(text=comp_labels.get(val, ""))
         comp_combo.bind("<<ComboboxSelected>>", _update_comp_label)
 
         row += 1
-        ttk.Label(tab_adv, text="图标文件:").grid(row=row, column=0, sticky=W, pady=6)
-        icon_entry = ttk.Entry(tab_adv, textvariable=self.icon_var, width=50)
-        icon_entry.grid(row=row, column=1, sticky=W+E, padx=(4, 4), pady=6)
-        ttk.Button(tab_adv, text="浏览...", command=self._browse_icon).grid(row=row, column=2, pady=6)
-        tab_adv.columnconfigure(1, weight=1)
+        ttk.Label(f, text="应用图标").grid(row=row, column=0, sticky=W, pady=7)
+        icon_entry = ttk.Entry(f, textvariable=self.icon_var)
+        icon_entry.grid(row=row, column=1, sticky="ew", padx=(14, 10), pady=7)
+        ttk.Button(f, text="浏览", command=self._browse_icon).grid(row=row, column=2, pady=7)
+        f.columnconfigure(1, weight=1)
 
         row += 1
-        ttk.Label(tab_adv, text="排除规则:").grid(row=row, column=0, sticky=W, pady=6)
-        ttk.Entry(tab_adv, textvariable=self.exclude_var, width=70).grid(row=row, column=1, columnspan=2, sticky=W+E, padx=(4, 0), pady=6)
+        ttk.Label(f, text="排除规则").grid(row=row, column=0, sticky=W, pady=7)
+        ttk.Entry(f, textvariable=self.exclude_var).grid(row=row, column=1, columnspan=2,
+                                                       sticky="ew", padx=(14, 0), pady=7)
 
         row += 1
-        hint = ttk.Label(tab_adv, text="提示: 多个规则用逗号分隔，支持通配符(*.log, __pycache__等)", foreground="gray")
-        hint.grid(row=row, column=0, columnspan=3, sticky=W, pady=(0, 4))
+        ttk.Label(f, text="多个规则用逗号分隔，支持通配符，如 *.log、__pycache__、.git",
+                  style="Hint.TLabel").grid(row=row, column=0, columnspan=3, sticky=W, pady=(2, 0))
 
-        row += 1
-        inno_frame = ttk.LabelFrame(tab_adv, text="Inno Setup 高级选项 (仅 Inno Setup 模式生效)", padding=8)
-        inno_frame.grid(row=row, column=0, columnspan=3, sticky=W+E, pady=(8, 0))
-        inno_frame.columnconfigure(1, weight=1)
+        # Inno Setup 专属选项
+        inno_card = self.register_glass(
+            GlassPanel(tab_adv, self, radius=16, padding=13, title="安装程序设置",
+                       hint="仅 Inno Setup 模式生效"))
+        inno_card.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(14, 0))
+        inno_frame = inno_card.body
 
         inno_row = 0
-        ttk.Label(inno_frame, text="许可证文件:").grid(row=inno_row, column=0, sticky=W, pady=4)
+        ttk.Label(inno_frame, text="许可证文件").grid(row=inno_row, column=0, sticky=W, pady=5)
         self.license_var = StringVar(value=self.cfg.get("license_file", ""))
-        ttk.Entry(inno_frame, textvariable=self.license_var, width=50).grid(row=inno_row, column=1, sticky=W+E, padx=(4, 4), pady=4)
-        ttk.Button(inno_frame, text="浏览...", command=self._browse_license).grid(row=inno_row, column=2, pady=4)
+        ttk.Entry(inno_frame, textvariable=self.license_var).grid(row=inno_row, column=1, sticky="ew", padx=(14, 10), pady=6)
+        ttk.Button(inno_frame, text="浏览", command=self._browse_license).grid(row=inno_row, column=2, pady=6)
+        inno_frame.columnconfigure(1, weight=1)
 
         inno_row += 1
-        ttk.Label(inno_frame, text="安装前命令:").grid(row=inno_row, column=0, sticky=W, pady=4)
+        ttk.Label(inno_frame, text="安装前命令").grid(row=inno_row, column=0, sticky=W, pady=5)
         self.pre_install_var = StringVar(value=self.cfg.get("pre_install_cmd", ""))
-        ttk.Entry(inno_frame, textvariable=self.pre_install_var, width=50).grid(row=inno_row, column=1, columnspan=2, sticky=W+E, padx=(4, 0), pady=4)
+        ttk.Entry(inno_frame, textvariable=self.pre_install_var).grid(row=inno_row, column=1, columnspan=2,
+                                                                     sticky="ew", padx=(14, 0), pady=6)
 
         inno_row += 1
-        ttk.Label(inno_frame, text="安装后命令:").grid(row=inno_row, column=0, sticky=W, pady=4)
+        ttk.Label(inno_frame, text="安装后命令").grid(row=inno_row, column=0, sticky=W, pady=5)
         self.post_install_var = StringVar(value=self.cfg.get("post_install_cmd", ""))
-        ttk.Entry(inno_frame, textvariable=self.post_install_var, width=50).grid(row=inno_row, column=1, columnspan=2, sticky=W+E, padx=(4, 0), pady=4)
-
-        row += 1
-        tool_frame = ttk.LabelFrame(tab_adv, text="工具检测", padding=8)
-        tool_frame.grid(row=row, column=0, columnspan=3, sticky=W+E, pady=(8, 0))
-        self.inno_label = ttk.Label(tool_frame, text="Inno Setup: 检测中...")
-        self.inno_label.pack(anchor=W)
-        self.zip7_label = ttk.Label(tool_frame, text="7-Zip: 检测中...")
-        self.zip7_label.pack(anchor=W)
-        self.nsis_label = ttk.Label(tool_frame, text="NSIS: 检测中...")
-        self.nsis_label.pack(anchor=W)
-
-        row += 1
-        btn_frame = Frame(tab_adv)
-        btn_frame.grid(row=row, column=0, columnspan=3, sticky=W, pady=(8, 0))
-        ttk.Button(btn_frame, text="预览脚本 (Inno/NSIS)", command=self._preview_iss_script).pack(side=LEFT, padx=(0, 8))
+        ttk.Entry(inno_frame, textvariable=self.post_install_var).grid(row=inno_row, column=1,
+                                                                      sticky="ew", padx=(14, 10), pady=5)
+        ttk.Button(inno_frame, text="预览脚本", command=self._preview_iss_script).grid(row=inno_row, column=2, pady=5)
 
     def _build_tab_history(self, notebook):
-        tab_hist = ttk.Frame(notebook, padding=10)
+        tab_hist = ttk.Frame(notebook, padding=(18, 16))
         notebook.add(tab_hist, text=" 构建历史 ")
+        tab_hist.columnconfigure(0, weight=1)
+        tab_hist.rowconfigure(0, weight=1)
 
-        toolbar = Frame(tab_hist)
-        toolbar.pack(fill=X, pady=(0, 4))
-        ttk.Button(toolbar, text="清除历史", command=self._clear_build_history).pack(side=LEFT, padx=(0, 8))
-        ttk.Button(toolbar, text="刷新", command=self._refresh_build_history).pack(side=LEFT)
+        card = self.register_glass(GlassPanel(tab_hist, self, radius=16, padding=16))
+        card.pack(fill=BOTH, expand=True)
+        body = card.inner
+
+        toolbar = ttk.Frame(body)
+        toolbar.pack(fill=X, pady=(0, 12))
+        toolbar.configure(style="Shell.TFrame")
+        ttk.Label(toolbar, text="最近构建", style="Section.TLabel").pack(side=LEFT)
+        ttk.Button(toolbar, text="刷新", command=self._refresh_build_history).pack(side=RIGHT)
+        ttk.Button(toolbar, text="清除历史", command=self._clear_build_history).pack(side=RIGHT, padx=(0, 8))
+
+        tree_wrap = ttk.Frame(body)
+        tree_wrap.pack(fill=BOTH, expand=True)
+        tree_wrap.configure(style="Shell.TFrame")
 
         columns = ("time", "app_name", "mode", "output", "status")
-        self.history_tree = ttk.Treeview(tab_hist, columns=columns, show="headings", selectmode="browse")
+        self.history_tree = ttk.Treeview(tree_wrap, columns=columns, show="headings",
+                                      selectmode="browse")
         self.history_tree.heading("time", text="时间")
         self.history_tree.heading("app_name", text="应用名")
         self.history_tree.heading("mode", text="模式")
         self.history_tree.heading("output", text="输出文件")
         self.history_tree.heading("status", text="状态")
-        self.history_tree.column("time", width=140, minwidth=100)
-        self.history_tree.column("app_name", width=120, minwidth=80)
-        self.history_tree.column("mode", width=80, minwidth=60)
-        self.history_tree.column("output", width=300, minwidth=150)
-        self.history_tree.column("status", width=80, minwidth=60)
+        self.history_tree.column("time", width=150, minwidth=110)
+        self.history_tree.column("app_name", width=130, minwidth=80)
+        self.history_tree.column("mode", width=90, minwidth=60)
+        self.history_tree.column("output", width=320, minwidth=150)
+        self.history_tree.column("status", width=80, minwidth=60, anchor="center")
 
-        hist_scroll_y = ttk.Scrollbar(tab_hist, orient="vertical", command=self.history_tree.yview)
-        hist_scroll_x = ttk.Scrollbar(tab_hist, orient="horizontal", command=self.history_tree.xview)
+        hist_scroll_y = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.history_tree.yview)
+        hist_scroll_x = ttk.Scrollbar(tree_wrap, orient="horizontal", command=self.history_tree.xview)
         self.history_tree.configure(yscrollcommand=hist_scroll_y.set, xscrollcommand=hist_scroll_x.set)
 
-        self.history_tree.pack(side=LEFT, fill=BOTH, expand=True)
-        hist_scroll_y.pack(side=RIGHT, fill=Y)
+        self.history_tree.grid(row=0, column=0, sticky="nsew")
+        hist_scroll_y.grid(row=0, column=1, sticky="ns")
+        hist_scroll_x.grid(row=1, column=0, sticky="ew")
+        tree_wrap.rowconfigure(0, weight=1)
+        tree_wrap.columnconfigure(0, weight=1)
 
         self._refresh_build_history()
 
-    def _build_bottom(self, main_frame):
-        bottom_frame = Frame(main_frame)
-        bottom_frame.pack(fill=X, pady=(0, 4))
+    def _build_bottom(self, parent):
+        # 操作卡片：按钮 + 进度 + 状态压到两行，给内容区让出垂直空间
+        action_panel = self.register_glass(
+            GlassPanel(parent, self, radius=20, padding=12))
+        action_panel.pack(fill=X, pady=(0, 10))
+        row1 = ttk.Frame(action_panel.body)
+        row1.pack(fill=X)
+        row1.configure(style="Shell.TFrame")
 
-        progress_frame = Frame(bottom_frame)
-        progress_frame.pack(fill=X, pady=(0, 4))
-        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var,
-                                            maximum=100, mode="determinate")
-        self.progress_bar.pack(fill=X, side=LEFT, expand=True, padx=(0, 8))
-        ttk.Label(progress_frame, textvariable=self.progress_var, width=4).pack(side=RIGHT)
-
-        ttk.Label(bottom_frame, textvariable=self.status_var, style="Status.TLabel").pack(fill=X, pady=(0, 4))
-
-        btn_frame = Frame(bottom_frame)
-        btn_frame.pack(fill=X)
-        self.build_button = ttk.Button(btn_frame, text="开始打包 (Ctrl+B)", style="Build.TButton",
+        self.build_button = ttk.Button(row1, text="开始打包", style="Build.TButton",
                                        command=self._start_build)
-        self.build_button.pack(side=LEFT, padx=(0, 8))
-        ttk.Button(btn_frame, text="打开输出目录", command=self._open_output_dir).pack(side=LEFT, padx=(0, 8))
-        ttk.Button(btn_frame, text="退出", command=self._on_close).pack(side=LEFT)
+        self.build_button.pack(side=LEFT)
 
-        log_frame = ttk.LabelFrame(main_frame, text="日志", padding=4)
-        log_frame.pack(fill=BOTH, expand=True, pady=(4, 0))
+        btn_group = ttk.Frame(row1)
+        btn_group.pack(side=LEFT, padx=(10, 0))
+        btn_group.configure(style="Shell.TFrame")
+        ttk.Button(btn_group, text="打开输出目录", command=self._open_output_dir).pack(side=LEFT, padx=(0, 8))
+        ttk.Button(btn_group, text="预览脚本", command=self._preview_iss_script).pack(side=LEFT, padx=(0, 8))
+        ttk.Button(btn_group, text="退出", command=self._on_close).pack(side=LEFT)
 
-        log_toolbar = Frame(log_frame)
-        log_toolbar.pack(fill=X, pady=(0, 2))
-        ttk.Button(log_toolbar, text="清空日志", command=self._clear_log).pack(side=LEFT, padx=(0, 4))
-        ttk.Button(log_toolbar, text="保存日志", command=self._save_log).pack(side=LEFT)
+        # 进度条与百分比并入同一行，替代原先独占一行
+        pct = ttk.Label(row1, textvariable=self.progress_var, style="Status.TLabel",
+                        width=5, anchor=E)
+        pct.pack(side=RIGHT)
+        self.progress_bar = ttk.Progressbar(row1, variable=self.progress_var,
+                                            maximum=100, mode="determinate")
+        self.progress_bar.pack(side=RIGHT, fill=X, expand=True, padx=(16, 10))
 
-        self.log_text = ScrolledText(log_frame, height=8, font=("Consolas", 9),
-                                     state=DISABLED, wrap=WORD)
+        ttk.Label(action_panel.body, textvariable=self.status_var,
+                  style="Status.TLabel").pack(fill=X, pady=(9, 0))
+
+        # 日志卡片：可折叠。默认收起以把垂直空间让给内容区；
+        # 打包日志开始输出时会自动展开，用户也可手动切换。
+        log_panel = self.register_glass(
+            GlassPanel(parent, self, radius=20, padding=12))
+        log_panel.pack(fill=X, pady=(0, 2))
+        log_body = log_panel.body
+
+        log_toolbar = ttk.Frame(log_body)
+        log_toolbar.pack(fill=X)
+        log_toolbar.configure(style="Shell.TFrame")
+        ttk.Label(log_toolbar, text="运行日志", style="Section.TLabel").pack(side=LEFT)
+        # 默认收起：空闲时把垂直空间让给内容区；打包日志一到会自动展开
+        self._log_toggle_btn = ttk.Button(log_toolbar, text="展开",
+                                          style="Ghost.TButton",
+                                          command=self._toggle_log_panel)
+        self._log_toggle_btn.pack(side=RIGHT)
+        ttk.Button(log_toolbar, text="清空", command=self._clear_log).pack(side=RIGHT, padx=(0, 8))
+
+        self._log_holder = ttk.Frame(log_body)
+        self._log_holder.configure(style="Shell.TFrame")
+        ttk.Button(self._log_holder, text="保存日志", style="Ghost.TButton",
+                   command=self._save_log).pack(side=RIGHT, pady=(6, 0))
+
+        self.log_text = ScrolledText(self._log_holder, height=5, font=self._mono(9),
+                                     state=DISABLED, wrap=WORD, bd=0,
+                                     highlightthickness=0,
+                                     padx=12, pady=10)
         self.log_text.pack(fill=BOTH, expand=True)
+        # 收起状态：holder 不 pack
+        self._log_expanded = False
+
+    def _toggle_log_panel(self):
+        """折叠/展开日志区（默认展开，收起可把空间让给内容区）"""
+        try:
+            if self._log_expanded:
+                self._log_holder.pack_forget()
+                self._log_expanded = False
+                self._log_toggle_btn.config(text="展开")
+            else:
+                self._log_holder.pack(fill=BOTH, expand=True)
+                self._log_expanded = True
+                self._log_toggle_btn.config(text="收起")
+        except Exception:
+            pass
 
     def _clear_log(self):
         self.log_text.config(state=NORMAL)
@@ -1497,27 +2254,60 @@ class PackagerApp:
     # G. Tool Detection
     # ============================================================
     def _check_tools(self):
-        inno = find_inno_setup()
-        sz7 = find_7zip()
-        if inno:
-            self.inno_label.config(text="Inno Setup: 已找到 (%s)" % os.path.basename(os.path.dirname(inno)), foreground="green")
-        else:
-            self.inno_label.config(text="Inno Setup: 未找到", foreground="red")
-        if sz7:
-            self.zip7_label.config(text="7-Zip: 已找到 (%s)" % os.path.dirname(sz7), foreground="green")
-        else:
-            self.zip7_label.config(text="7-Zip: 未找到", foreground="red")
-        nsis = find_nsis()
-        if nsis:
-            self.nsis_label.config(text="NSIS: 已找到 (%s)" % os.path.dirname(nsis), foreground="green")
-        else:
-            self.nsis_label.config(text="NSIS: 未找到", foreground="red")
+        """探测外部工具，结果同时驱动标题栏摘要与提示气泡。
+
+        状态用 ttk 样式而非 foreground 硬编码颜色，否则切到浅色主题时
+        "红色=缺失" 在浅色底上几乎看不清。
+        """
+        results = []
+        for attr, name, path, show_dir in (
+                ("inno_label", "Inno Setup", find_inno_setup(), False),
+                ("zip7_label", "7-Zip", find_7zip(), True),
+                ("nsis_label", "NSIS", find_nsis(), True)):
+            if path:
+                where = (os.path.dirname(path) if show_dir
+                         else os.path.basename(os.path.dirname(path)))
+                results.append((name, True, where))
+            else:
+                results.append((name, False, ""))
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                try:
+                    ok = results[-1][1]
+                    widget.config(text="%s · %s" % (name, "已就绪" if ok else "未安装"),
+                                  style="OK.TLabel" if ok else "Danger.TLabel")
+                except Exception:
+                    pass
+
+        var = getattr(self, "_tools_summary_var", None)
+        if var is not None:
+            try:
+                var.set("   ".join(
+                    ("%s %s" % (n, "OK" if ok else "缺")) for n, ok, _w in results))
+            except Exception:
+                pass
+        detail = getattr(self, "_tools_detail", None)
+        if detail is not None:
+            try:
+                detail.set("\n".join(
+                    "%s: %s" % (n, ("已就绪  " + w) if ok else "未安装")
+                    for n, ok, w in results))
+            except Exception:
+                pass
 
     # ============================================================
     # H. Logging & Progress
     # ============================================================
     def _log(self, msg):
         def _do():
+            # 自动展开必须放在 _do 内部：_log 会被后台打包线程调用
+            # （如 run_batch 的汇总日志含 "=========="），在调用者线程直接
+            # 操作 Tk 控件会跨线程，违反 Tk 非线程安全契约。
+            try:
+                if not self._log_expanded and "==========" in str(msg):
+                    self._toggle_log_panel()
+            except Exception:
+                pass
             try:
                 self.log_text.config(state=NORMAL)
                 if "[成功]" in msg:
@@ -1732,7 +2522,8 @@ class PackagerApp:
                             mode_names.get(mode, mode), app_name, output_file, True
                         )
                         self._play_finish_sound(success=True)
-                        messagebox.showinfo("完成", "打包成功完成!")
+                        if not getattr(self, "_closing", False):
+                            messagebox.showinfo("完成", "打包成功完成!")
                     else:
                         self._set_status("打包失败")
                         self._add_build_history(
@@ -1878,6 +2669,8 @@ class PackagerApp:
                 self._play_finish_sound(success=(ok_count == total))
 
                 def finish():
+                    if getattr(self, "_closing", False):
+                        return
                     messagebox.showinfo("批量打包完成",
                                         "成功: %d / %d\n详见日志。" % (ok_count, total))
                 self._call_in_ui(finish)
@@ -2067,15 +2860,23 @@ class PackagerApp:
 
         win = Toplevel(self.root)
         win.title(win_title)
-        win.geometry("700x550")
+        win.geometry("720x580")
+        p = self.palette()
+        try:
+            win.configure(bg=self.card_bg())
+        except Exception:
+            pass
 
-        text_widget = ScrolledText(win, font=("Consolas", 10), wrap=WORD)
-        text_widget.pack(fill=BOTH, expand=True, padx=6, pady=6)
+        text_widget = ScrolledText(win, font=self._mono(10), wrap=WORD,
+                                   bd=0, highlightthickness=0, padx=14, pady=12)
+        text_widget.pack(fill=BOTH, expand=True, padx=14, pady=(14, 8))
         text_widget.insert("1.0", script_content)
-        text_widget.config(state=DISABLED)
+        text_widget.config(state=DISABLED, bg=rgb_to_hex(p["log"]),
+                           fg=p["text"], insertbackground=p["text"])
 
-        btn_frame = Frame(win)
-        btn_frame.pack(fill=X, padx=6, pady=(0, 6))
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(fill=X, padx=14, pady=(0, 14))
+        btn_frame.configure(style="Shell.TFrame")
 
         def copy_to_clipboard():
             self.root.clipboard_clear()
@@ -2101,50 +2902,70 @@ class PackagerApp:
     def _show_about(self):
         about_win = Toplevel(self.root)
         about_win.title("关于 %s" % APP_NAME)
-        about_win.geometry("420x380")
+        about_win.geometry("460x430")
         about_win.resizable(False, False)
+        p = self.palette()
+        try:
+            about_win.configure(bg=self.card_bg())
+        except Exception:
+            pass
 
-        content = Frame(about_win, padx=20, pady=20)
+        content = ttk.Frame(about_win, padding=22)
         content.pack(fill=BOTH, expand=True)
+        content.configure(style="Shell.TFrame")
 
-        Label(content, text=APP_NAME, font=("Microsoft YaHei UI", 18, "bold")).pack(pady=(0, 4))
-        Label(content, text="版本 %s" % APP_VERSION, font=("Microsoft YaHei UI", 11)).pack(pady=(0, 12))
+        ttk.Label(content, text=APP_NAME, style="Title.TLabel").pack(pady=(0, 4))
+        ttk.Label(content, text="版本 %s" % APP_VERSION,
+                  style="Subtitle.TLabel").pack(pady=(0, 14))
 
         features = [
-            "  四种打包模式: Inno Setup / 7-Zip SFX / ZIP / NSIS",
-            "  深色/浅色主题切换",
-            "  项目文件保存与加载 / 最近项目",
-            "  文件预览搜索过滤 + 文件类型统计",
-            "  批量打包多个文件夹",
-            "  Inno Setup / NSIS 脚本预览",
-            "  构建历史记录",
-            "  文件树右键菜单（复制路径/打开）",
-            "  导出文件列表 CSV / 导出导入配置",
-            "  自动保存防崩溃",
-            "  键盘快捷键支持",
-            "  命令行模式打包 (支持 --dry-run --list-modes)",
+            "液态玻璃界面，支持深色 / 浅色主题",
+            "四种打包模式: Inno Setup / NSIS / 7-Zip SFX / ZIP",
+            "排除规则在打包阶段生效，四模式语义一致",
+            "批量打包多个文件夹，输出带序号的子目录",
+            "文件预览搜索过滤 + 文件类型统计",
+            "项目文件保存与加载 / 最近项目",
+            "Inno Setup / NSIS 安装脚本预览",
+            "构建历史记录，可导出 CSV",
+            "文件树右键菜单（复制路径 / 打开）",
+            "自动保存防崩溃",
+            "键盘快捷键支持 (Ctrl+B / Ctrl+T / F5)",
+            "命令行模式打包 (支持 --dry-run --list-modes)",
         ]
-        Label(content, text="功能列表:", font=("Microsoft YaHei UI", 10, "bold"), anchor=W).pack(fill=X, pady=(0, 4))
+        ttk.Label(content, text="功能列表", style="Section.TLabel").pack(
+            fill=X, pady=(0, 6))
         for feat in features:
-            Label(content, text=feat, font=("Microsoft YaHei UI", 9), anchor=W, foreground="#333333").pack(fill=X, pady=1)
+            ttk.Label(content, text="· " + feat, style="Status.TLabel").pack(
+                fill=X, anchor=W, pady=1)
 
-        ttk.Separator(content, orient="horizontal").pack(fill=X, pady=8)
+        ttk.Separator(content, orient="horizontal").pack(fill=X, pady=12)
 
-        Label(content, text="项目主页:", font=("Microsoft YaHei UI", 10, "bold"), anchor=W).pack(fill=X, pady=(0, 2))
+        ttk.Label(content, text="项目主页", style="Section.TLabel").pack(
+            fill=X, pady=(0, 4))
         for _name, _url in REPO_URLS:
-            link = Label(content, text=_url,
-                         font=("Microsoft YaHei UI", 9), foreground="blue", cursor="hand2")
+            link = ttk.Label(content, text=_url, style="Link.TLabel",
+                             cursor="hand2")
             link.pack(anchor=W)
             # 默认参数绑定，避免闭包捕获最后一个循环变量
             link.bind("<Button-1>", lambda e, u=_url: self._open_url(u))
 
-        ttk.Button(content, text="关闭", command=about_win.destroy).pack(pady=(12, 0))
+        ttk.Button(content, text="关闭", command=about_win.destroy).pack(pady=(16, 0))
 
     def _open_url(self, url):
         import webbrowser
         webbrowser.open(url)
 
     def _on_close(self):
+        # 打包进行中直接 destroy，worker 线程后续的 messagebox/控件回调
+        # 会打到已销毁的控件上，抛错并被 except 吞掉（表现为 stderr 刷栈）。
+        # 先确认并置位 _closing，让收尾回调跳过弹窗。
+        if self._building:
+            ok = messagebox.askyesno(
+                "确认退出",
+                "正在打包中，关闭会中断当前任务。\n确定要退出吗？")
+            if not ok:
+                return
+            self._closing = True
         try:
             project_data = self._get_project_data()
             self.cfg.update(project_data)
@@ -2164,50 +2985,77 @@ class PackagerApp:
             save_config(self.cfg)
         except Exception:
             pass
+        # 取消所有 pending 定时器：窗口销毁后若仍触发，会对已销毁控件
+        # 做 PIL 渲染并产生无谓告警
+        for attr in ("_backdrop_after_id", "_source_after_id", "_search_after_id"):
+            aid = getattr(self, attr, None)
+            if aid is not None:
+                try:
+                    self.root.after_cancel(aid)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        for panel in getattr(self, "_glass_panels", []):
+            try:
+                if panel._pending is not None:
+                    panel.after_cancel(panel._pending)
+                    panel._pending = None
+            except Exception:
+                pass
         self.root.destroy()
 
     # ============================================================
     # P. v4.0.0 - File Type Statistics Tab
     # ============================================================
     def _build_tab_stats(self, notebook):
-        tab_stats = ttk.Frame(notebook, padding=10)
+        tab_stats = ttk.Frame(notebook, padding=(18, 16))
         notebook.add(tab_stats, text=" 文件统计 ")
+        tab_stats.columnconfigure(0, weight=1)
+        tab_stats.rowconfigure(0, weight=1)
+
+        card = self.register_glass(GlassPanel(tab_stats, self, radius=16,
+                                              padding=16, title="文件类型分布",
+                                              hint="按扩展名统计当前源文件夹的文件构成"))
+        card.grid(row=0, column=0, sticky="nsew")
+        body = card.body
 
         columns = ("ext", "count", "total_size", "ratio")
-        self.stats_tree = ttk.Treeview(tab_stats, columns=columns, show="headings", selectmode="browse")
+        self.stats_tree = ttk.Treeview(body, columns=columns, show="headings",
+                                        selectmode="browse")
         self.stats_tree.heading("ext", text="文件扩展名")
         self.stats_tree.heading("count", text="文件数量")
         self.stats_tree.heading("total_size", text="总大小")
         self.stats_tree.heading("ratio", text="占比")
         self.stats_tree.column("ext", width=150, minwidth=100)
-        self.stats_tree.column("count", width=100, minwidth=80, anchor=E)
-        self.stats_tree.column("total_size", width=120, minwidth=80, anchor=E)
-        self.stats_tree.column("ratio", width=100, minwidth=80, anchor=E)
+        self.stats_tree.column("count", width=100, minwidth=80, anchor="e")
+        self.stats_tree.column("total_size", width=120, minwidth=80, anchor="e")
+        self.stats_tree.column("ratio", width=100, minwidth=80, anchor="e")
 
-        stats_scroll_y = ttk.Scrollbar(tab_stats, orient="vertical", command=self.stats_tree.yview)
-        stats_scroll_x = ttk.Scrollbar(tab_stats, orient="horizontal", command=self.stats_tree.xview)
+        stats_scroll_y = ttk.Scrollbar(body, orient="vertical", command=self.stats_tree.yview)
+        stats_scroll_x = ttk.Scrollbar(body, orient="horizontal", command=self.stats_tree.xview)
         self.stats_tree.configure(yscrollcommand=stats_scroll_y.set, xscrollcommand=stats_scroll_x.set)
 
         self.stats_tree.pack(side=LEFT, fill=BOTH, expand=True)
         stats_scroll_y.pack(side=RIGHT, fill=Y)
         stats_scroll_x.pack(side=BOTTOM, fill=X)
 
-        stats_bottom = Frame(tab_stats)
-        stats_bottom.pack(fill=X, pady=(4, 0))
-        self.stats_total_files_label = ttk.Label(stats_bottom, text="总文件数: 0", style="Status.TLabel")
-        self.stats_total_files_label.pack(side=LEFT, padx=(0, 20))
-        self.stats_total_size_label = ttk.Label(stats_bottom, text="总大小: 0 B", style="Status.TLabel")
-        self.stats_total_size_label.pack(side=LEFT, padx=(0, 20))
-        self.stats_type_count_label = ttk.Label(stats_bottom, text="文件类型数: 0", style="Status.TLabel")
+        stats_bottom = ttk.Frame(body)
+        stats_bottom.configure(style="Shell.TFrame")
+        stats_bottom.pack(fill=X, pady=(10, 0))
+        self.stats_total_files_label = ttk.Label(stats_bottom, text="总文件数  0", style="Status.TLabel")
+        self.stats_total_files_label.pack(side=LEFT, padx=(0, 24))
+        self.stats_total_size_label = ttk.Label(stats_bottom, text="总大小  0 B", style="Status.TLabel")
+        self.stats_total_size_label.pack(side=LEFT, padx=(0, 24))
+        self.stats_type_count_label = ttk.Label(stats_bottom, text="文件类型数  0", style="Status.TLabel")
         self.stats_type_count_label.pack(side=LEFT)
 
     def _update_stats(self):
         for item in self.stats_tree.get_children():
             self.stats_tree.delete(item)
         if not self.scanned_files:
-            self.stats_total_files_label.config(text="总文件数: 0")
-            self.stats_total_size_label.config(text="总大小: 0 B")
-            self.stats_type_count_label.config(text="文件类型数: 0")
+            self.stats_total_files_label.config(text="总文件数  0")
+            self.stats_total_size_label.config(text="总大小  0 B")
+            self.stats_type_count_label.config(text="文件类型数  0")
             return
         ext_map = {}
         for rel_path, sz in self.scanned_files:
@@ -2224,9 +3072,9 @@ class PackagerApp:
             self.stats_tree.insert("", "end", values=(
                 ext, info["count"], format_size(info["size"]), ratio
             ))
-        self.stats_total_files_label.config(text="总文件数: %d" % len(self.scanned_files))
-        self.stats_total_size_label.config(text="总大小: %s" % format_size(total_size))
-        self.stats_type_count_label.config(text="文件类型数: %d" % len(ext_map))
+        self.stats_total_files_label.config(text="总文件数  %d" % len(self.scanned_files))
+        self.stats_total_size_label.config(text="总大小  %s" % format_size(total_size))
+        self.stats_type_count_label.config(text="文件类型数  %d" % len(ext_map))
 
     # ============================================================
     # Q. v4.0.0 - Export / Import Config
@@ -2298,14 +3146,17 @@ class PackagerApp:
                 self.batch_listbox.insert(END, d)
             else:
                 messagebox.showinfo("提示", "该文件夹已在列表中")
+            self._refresh_batch_hint()
 
     def _remove_batch_folder(self):
         selected = self.batch_listbox.curselection()
         for idx in reversed(selected):
             self.batch_listbox.delete(idx)
+        self._refresh_batch_hint()
 
     def _clear_batch_folders(self):
         self.batch_listbox.delete(0, END)
+        self._refresh_batch_hint()
 
     def _export_file_list_csv(self):
         """导出文件列表为CSV"""
@@ -2338,7 +3189,7 @@ class PackagerApp:
         source = self.source_var.get()
         if not source or not os.path.isdir(source):
             self.file_count_label.config(text="文件数: 0")
-            self.file_size_label.config(text="总大小: 0 B")
+            self.file_size_label.config(text="总大小  0 B")
             self._update_stats()
             return
         self._set_status("正在扫描文件...")
@@ -2365,8 +3216,8 @@ class PackagerApp:
                     self.file_tree.insert("", "end", values=(
                         "… 还有 %d 个文件未显示 (已截断，搜索可匹配全部)" % (len(files) - FILE_TREE_MAX_DISPLAY),
                         "", ), tags=("truncated",))
-                self.file_count_label.config(text="文件数: %d" % len(files))
-                self.file_size_label.config(text="总大小: %s" % format_size(total_size))
+                self.file_count_label.config(text="文件数  %d" % len(files))
+                self.file_size_label.config(text="总大小  %s" % format_size(total_size))
                 self._set_status("扫描完成: %d 个文件, %s" % (len(files), format_size(total_size)))
                 self._update_stats()
 
