@@ -25,7 +25,14 @@ import packager as pk
 
 pytest.importorskip("PySide6", reason="未安装 PySide6")
 
-from PySide6 import QtCore, QtGui, QtWidgets  # noqa: E402
+# QtGui 在 Linux 上 import 时就会 dlopen 系统库（libEGL.so.1 等）。
+# 这些库缺失时抛的是 ImportError 而非 ModuleNotFoundError，
+# importorskip 抓不到，必须在这里单独兜住，否则整个文件在 collection
+# 阶段就失败（连带 test_packager.py 的结果一起丢）。
+try:
+    from PySide6 import QtCore, QtGui, QtWidgets  # noqa: E402
+except (ImportError, OSError) as exc:  # pragma: no cover - 环境缺 Qt 运行库
+    pytest.skip("无法加载 Qt 运行库: %s" % exc, allow_module_level=True)
 
 import packager_ui as ui  # noqa: E402
 
