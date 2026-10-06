@@ -717,7 +717,9 @@ def test_real_file_starting_with_ellipsis_is_not_truncation(win, qapp):
     win.src_edit.setText(r"C:\src")
     item = win._add_tree_row(win.file_tree, "…真正的文件.txt", "1 B")
     win.file_tree.setCurrentItem(item)
-    assert win._current_tree_path() == r"C:\src\…真正的文件.txt"
+    # 用 os.path.join 构造期望值：Windows 下是 \，Linux CI 下是 /
+    expected = os.path.join(r"C:\src", "…真正的文件.txt")
+    assert win._current_tree_path() == expected
     win.src_edit.setText("")
 
 
@@ -761,7 +763,8 @@ def test_file_tree_right_click_targets_clicked_row(win, qapp, monkeypatch):
     monkeypatch.setattr(win, "_build_file_tree_menu", fake_build)
     win._on_file_tree_right_click(pos)
 
-    assert seen.get("path") == r"C:\src\f3.txt", \
+    expected = os.path.join(r"C:\src", "f%d.txt" % target_row)
+    assert seen.get("path") == expected, \
         "右键菜单作用到了错误的行（实际: %r）" % seen.get("path")
     assert win.file_tree.currentItem() is rows[target_row]
     assert menu.executed is True
@@ -792,7 +795,8 @@ def test_file_tree_menu_actions_carry_target_path(win, qapp):
     menu.actions()[1].trigger()      # 复制完整路径
     assert copied == [path]
     menu.actions()[0].trigger()      # 复制文件名
-    assert copied[-1] == "file.txt"
+    # 用 os.path.basename 而非硬编码：Windows 下是 \，Linux CI 下 /
+    assert copied[-1] == os.path.basename(path)
 
 
 def test_export_file_list_csv(win, qapp, tmp_path, monkeypatch):
