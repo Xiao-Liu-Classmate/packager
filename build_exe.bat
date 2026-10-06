@@ -82,7 +82,9 @@ python -c "import hashlib,sys;print('  '+hashlib.sha256(open(sys.argv[1],'rb').r
 echo Python: 
 python -c "import sys;print('  '+sys.version.split()[0])"
 echo Qt:
-python -c "import PySide6;print('  PySide6 '+PySide6.__version__+' / Qt '+PySide6.QtCore.qVersion())" 2>nul
+REM 必须显式 from PySide6 import QtCore —— `import PySide6` 不会自动
+REM 导入子模块，PySide6.QtCore 属性访问会抛 AttributeError
+python -c "from PySide6 import QtCore;import PySide6;print('  PySide6 '+PySide6.__version__+' / Qt '+QtCore.qVersion())" 2>nul
 echo.
 echo Tip: put the SHA256 above plus the Python version into the
 echo       Release notes; the hash only matches THIS build.
