@@ -4,8 +4,18 @@
 # 在不同时间解析出的依赖组合可能不同，bootloader 与 hook 行为随之变化，
 # 产物会漂移。PyPI 禁止重发同一版本，因此精确 pin 同时也阻断了版本投毒。
 #
-# 生成方式：python -m pip freeze | Select-String "^(pyinstaller|altgraph|...)"
+# 生成方式：python -m pip freeze | Select-String "^(pyinstaller|pyside6|altgraph|...)"
 
+# --- GUI 引擎 ---
+# 界面层已迁移到 PySide6 / Qt 6。只装 Essentials（QtCore/Gui/Widgets/Qml/Quick
+# 等），不装 Addons：Addons 里的 QtWebEngine / QtMultimedia / libmpv 会让
+# exe 多出 60MB+ 而本项目一个都用不到。
+#   PySide6-Essentials == 6.10.3  ->  Qt 6.10.3
+#   PySide6-Essentials == 6.11.2  ->  Qt 6.11.2
+PySide6-Essentials==6.10.3
+shiboken6==6.10.3
+
+# --- 打包工具 ---
 pyinstaller==6.22.2
 pyinstaller-hooks-contrib==2026.7
 altgraph==0.17.5

@@ -13,9 +13,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 主目标平台为 Windows；Linux 用于兜底纯函数/CLI 测试
+        # 主目标平台为 Windows；Linux 用于兜底纯函数/CLI 测试。
+        # 3.8 已从矩阵移除：界面层迁到 PySide6/Qt 6 后，Python 3.8
+        # 不再受支持（PySide6 6.10 要求 >=3.9，这里取 3.10 起步）。
         os: [windows-latest, ubuntu-latest]
-        python-version: ["3.8", "3.10", "3.12"]
+        python-version: ["3.10", "3.11", "3.12"]
 
     steps:
       - name: Checkout
@@ -27,13 +29,16 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install test dependencies
-        run: python -m pip install --upgrade pip pytest
+        run: |
+          python -m pip install --upgrade pip pytest
+          python -m pip install PySide6-Essentials
 
       - name: Syntax check
-        run: python -c "import py_compile; py_compile.compile('packager.py', doraise=True); py_compile.compile('test_packager.py', doraise=True)"
+        run: |
+          python -c "import py_compile; py_compile.compile('packager.py', doraise=True); py_compile.compile('packager_ui.py', doraise=True); py_compile.compile('test_packager.py', doraise=True); py_compile.compile('test_ui.py', doraise=True)"
 
       - name: Run unit tests
-        run: python -m pytest test_packager.py -v --tb=short
+        run: python -m pytest test_packager.py test_ui.py -v --tb=short
 
       - name: CLI smoke test
         run: |

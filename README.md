@@ -94,11 +94,15 @@ python packager.py --source "C:\MyApp" --output "D:\output" `
 ## 测试
 
 ```powershell
-python -m pytest test_packager.py -v
+python -m pytest test_packager.py test_ui.py -v
 ```
 
-覆盖版本号规范化、路径/脚本字段校验、四种模式的排除语义、CLI 参数优先级、
-配置原子写与损坏恢复、ZIP 产物完整性、GUI 重入保护与按钮状态恢复。
+- `test_packager.py`：核心逻辑，不依赖 GUI——版本号规范化、路径/脚本字段校验、
+  四种模式的排除语义、CLI 参数优先级、配置原子写与损坏恢复、ZIP 产物完整性。
+- `test_ui.py`：界面层（PySide6/Qt），自设 `QT_QPA_PLATFORM=offscreen`，
+  无需显示器即可运行——覆盖主题切换与样式表、跨线程回调必须回到 UI 线程、
+  日志着色与自动展开、防抖定时器、批量列表、项目数据往返、文件树过滤与统计、
+  构建历史的跨线程写入、打包校验与重入保护。
 
 ## 构建单文件 exe
 
@@ -109,8 +113,9 @@ build_exe.bat
 ```
 
 脚本会依次：检测 Python（`python` → `py -3` 回退）→ 按 `requirements-build.txt`
-安装**锁定版本**的构建依赖 → 二次校验 PyInstaller 精确版本 → 运行单元测试
-（失败即阻断构建）→ 清理旧产物 → 打包 → 输出 `dist\packager.exe` 的大小、SHA256 与 Python 版本。
+安装**锁定版本**的构建依赖 → 二次校验 PyInstaller 与 PySide6 的精确版本 →
+运行单元测试（失败即阻断构建）→ 清理旧产物 → 打包 → 输出 `dist\packager.exe`
+的大小、SHA256、Python 与 Qt 版本。
 
 关于构建参数：
 
@@ -134,5 +139,19 @@ build_exe.bat
 ## 系统要求
 
 - Windows 10/11
-- Python 3.8+（仅源码运行时需要；`packager.exe` 免安装）
+- Python 3.10+（仅源码运行时需要；`packager.exe` 免安装）
 - 视打包模式另需 Inno Setup / NSIS / 7-Zip
+
+## 界面与依赖
+
+界面层使用 **PySide6 / Qt 6**（`packager_ui.py`），核心逻辑（`packager.py`）
+不依赖任何 GUI 框架，因此命令行模式在缺少 PySide6 时仍可使用。
+
+- **PySide6-Essentials 而非完整 PySide6**：前者只含 QtCore/Gui/Widgets/Qml/Quick，
+  后者额外携带 QtWebEngine、QtMultimedia、Qt3D 等（本项目一个都用不到），
+  会让 exe 多出约 60 MB。
+- **液态玻璃**：Windows 11 build 22621+ 通过
+  `DwmSetWindowAttribute(DWMWA_SYSTEMBACKDROP_TYPE)` 开启系统级 acrylic，
+  由系统合成器实时模糊窗口背后的内容；卡片本身用半透明 QSS 叠加形成层次。
+  Windows 10 / Linux / macOS 上自动降级为半透明纯色卡片（观感接近，无背景折射）。
+- **不需要 Pillow**：界面渲染完全交给 Qt，此前的 Pillow 像素级渲染已移除。

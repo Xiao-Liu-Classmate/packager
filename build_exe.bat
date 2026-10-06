@@ -36,8 +36,21 @@ if not "%INSTALLED%"=="6.22.2" (
     goto :version_mismatch
 )
 
+REM Verify the GUI engine version too: the UI layer is PySide6/Qt, and a
+REM different Qt minor changes stylesheet parsing and platform behavior.
+REM Fail closed rather than building against an unpinned GUI toolchain.
+set "QTV="
+for /f "delims=" %%v in ('python -c "import PySide6;print(PySide6.__version__)" 2^>nul') do set "QTV=%%v"
+if not "%QTV%"=="6.10.3" (
+    echo [ERROR] PySide6 version mismatch: expected 6.10.3, got "%QTV%"
+    echo         Run: python -m pip install -r requirements-build.txt
+    goto :version_mismatch
+)
+
 echo [3/5] Running unit tests (build is blocked on failure)...
-python -m pytest test_packager.py -q || goto :test_failed
+REM Both suites: test_packager.py (core logic) and test_ui.py (Qt UI layer).
+REM test_ui.py sets QT_QPA_PLATFORM=offscreen itself, so it needs no display.
+python -m pytest test_packager.py test_ui.py -q || goto :test_failed
 
 echo [4/5] Building exe...
 REM Remove any previous artifact first. --clean only clears caches and
@@ -68,6 +81,8 @@ REM some environments, and this script already depends on python.
 python -c "import hashlib,sys;print('  '+hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "dist\packager.exe"
 echo Python: 
 python -c "import sys;print('  '+sys.version.split()[0])"
+echo Qt:
+python -c "import PySide6;print('  PySide6 '+PySide6.__version__+' / Qt '+PySide6.QtCore.qVersion())" 2>nul
 echo.
 echo Tip: put the SHA256 above plus the Python version into the
 echo       Release notes; the hash only matches THIS build.
@@ -76,7 +91,8 @@ endlocal
 exit /b 0
 
 :no_python
-echo [ERROR] Python not found. Install Python 3.8+ and add it to PATH.
+echo [ERROR] Python not found. Install Python 3.10+ and add it to PATH.
+echo         PySide6 6.10 requires Python >= 3.9; 3.10+ is the supported floor.
 popd
 endlocal
 exit /b 1

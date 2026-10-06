@@ -9,6 +9,36 @@ import os
 
 # 用 SPECPATH 而非相对路径，保证从任意工作目录执行
 # `pyinstaller D:\path\to\packager.spec` 都能找到入口脚本
+# 界面层已迁移到 PySide6/Qt 6（packager_ui.py）。
+# PyInstaller 自带 PySide6 hook（pyinstaller-hooks-contrib），会自动收集
+# QtCore/QtGui/QtWidgets 及所需的 platform plugin，无需手工列 hiddenimports。
+#
+# 关于 excludes：这里只排掉**确实用不到**且体积大的模块。
+# 不要排 QtQuick/QtQml —— PySide6-Essentials 里的 QtWidgets 会间接引用它们，
+# 排掉会在运行时报 "DLL load failed"。真正的减体积手段是装
+# PySide6-Essentials 而不是完整的 PySide6（后者多带 QtWebEngine、
+# QtMultimedia、Qt3D 等，约 +60MB，见 requirements-build.txt）。
+EXCLUDES = [
+    # 未使用的可选功能（本项目不写文件预览/媒体/网络）
+    'PySide6.QtNetwork',
+    'PySide6.QtMultimedia',
+    'PySide6.QtWebEngineCore',
+    'PySide6.QtWebEngineWidgets',
+    'PySide6.Qt3DCore',
+    'PySide6.QtCharts',
+    'PySide6.QtDataVisualization',
+    'PySide6.QtOpenGL',
+    'PySide6.QtSql',
+    'PySide6.QtTest',
+    'PySide6.QtBluetooth',
+    'PySide6.QtPositioning',
+    'PySide6.QtSerialPort',
+    'PySide6.QtSensors',
+    'PySide6.QtSerialBus',
+    # 与 tkinter 同理：GUI 已不依赖它，排掉可少带一个模块
+    'tkinter',
+]
+
 a = Analysis(
     [os.path.join(SPECPATH, 'packager.py')],
     pathex=[],
@@ -18,7 +48,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=EXCLUDES,
     noarchive=False,
     optimize=0,
 )
